@@ -40,4 +40,5 @@ dist/
 generated_audio/
 *.log
 *.ini
+*.json
 # <<< AUTO DISCOVERED RULES <<<

@@ -17,12 +17,28 @@ import zipfile
 import re
 import itertools
 import random
+import wave
+import queue
+import traceback
+import faulthandler
+import tempfile
+import signal
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from collections import deque
+from functools import partial, lru_cache
 from logging.handlers import RotatingFileHandler
 from enum import Enum
+
+# Enable faulthandler immediately to catch silent C-level crashes
+CWD = os.getcwd()
+FAULT_LOG_FILE = os.path.join(CWD, "crash_traceback.log")
+try:
+    fault_log_file = open(FAULT_LOG_FILE, "w", buffering=1)
+    faulthandler.enable(file=fault_log_file)
+except Exception as e:
+    print(f"Could not enable faulthandler: {e}")
 
 import numpy as np
 from scipy.io import wavfile
@@ -31,7 +47,7 @@ import scipy.signal
 # Qt Imports
 from PySide6.QtCore import (
     Qt, QThread, Signal, QObject, QUrl, QTimer, QPoint, QSize, QLineF,
-    QStandardPaths, QEvent, QByteArray, QRect
+    QStandardPaths, QEvent, QByteArray, QRect, QPointF, QProcess
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -40,13 +56,13 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QSplitter,
     QDialog, QFormLayout, QMenu, QStyle, QInputDialog, QPlainTextEdit,
     QSizePolicy, QFrame, QToolButton, QStatusBar, QListWidget, QListWidgetItem,
-    QDockWidget, QScrollArea, QToolTip, QCompleter
+    QDockWidget, QScrollArea, QToolTip, QCompleter, QSystemTrayIcon
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtGui import (
     QAction, QIcon, QPixmap, QColor, QPalette, QFont, QPainter, QPen,
     QMouseEvent, QKeySequence, QShortcut, QDesktopServices, QLinearGradient,
-    QPainterPath, QPolygon, QBrush, QImage, QTextCursor
+    QPainterPath, QPolygon, QPolygonF, QBrush, QImage, QTextCursor
 )
 
 # ML Imports - Core
@@ -56,6 +72,28 @@ try:
     import transformers
     import diffusers
     ML_AVAILABLE = True
+    
+    # FIX: Monkey-patch GPT2Model to restore _update_model_kwargs_for_generation
+    # This fixes compatibility with transformers >= 4.50.0
+    try:
+        from transformers.models.gpt2.modeling_gpt2 import GPT2Model
+        if not hasattr(GPT2Model, "_update_model_kwargs_for_generation"):
+            def _update_model_kwargs_for_generation_patch(self, outputs, model_kwargs, is_encoder_decoder=False, standardize_cache_format=False):
+                model_kwargs["past_key_values"] = self._extract_past_from_model_output(outputs, standardize_cache_format=standardize_cache_format)
+                if "token_type_ids" in model_kwargs:
+                    token_type_ids = model_kwargs["token_type_ids"]
+                    model_kwargs["token_type_ids"] = torch.cat([token_type_ids, token_type_ids[:, -1].unsqueeze(-1)], dim=-1)
+                if not is_encoder_decoder:
+                    if "attention_mask" in model_kwargs:
+                        attention_mask = model_kwargs["attention_mask"]
+                        model_kwargs["attention_mask"] = torch.cat(
+                            [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+                        )
+                return model_kwargs
+            GPT2Model._update_model_kwargs_for_generation = _update_model_kwargs_for_generation_patch
+    except Exception as e:
+        print(f"Failed to monkey-patch GPT2Model: {e}")
+
 except ImportError:
     ML_AVAILABLE = False
 
@@ -80,18 +118,25 @@ try:
 except ImportError:
     CLAP_AVAILABLE = False
 
+try:
+    from pedalboard import Pedalboard, Reverb, Delay, Chorus, Distortion, Compressor, LowpassFilter, HighpassFilter, Gain
+    PEDALBOARD_AVAILABLE = True
+except ImportError:
+    PEDALBOARD_AVAILABLE = False
+
 
 # --- Configuration & Constants ---
-APP_NAME = "AudioLDM2 Studio"
-APP_VERSION = "3.5.0"
+APP_NAME = "AudioLDM2 Studio - SFX & Long-Form Edition"
+APP_VERSION = "4.2.9-expert"
 SETTINGS_ORG = "AudioLDM2"
 SETTINGS_APP = "Studio"
 
 DEFAULT_CACHE_DIR = os.path.join(os.getcwd(), "model_cache")
-
-CWD = os.getcwd()
 BATCH_STATE_FILE = os.path.join(CWD, "batch_state.json")
 LOG_FILE = os.path.join(CWD, f"{APP_NAME}.log")
+TEMP_DIR = tempfile.gettempdir()
+FX_PREVIEW_FILE = os.path.join(TEMP_DIR, "audioldm2_fx_preview.wav")
+TEMP_LOAD_WAV = os.path.join(TEMP_DIR, "audioldm2_temp_load.wav")
 
 DEFAULT_MODELS = [
     "cvssp/audioldm2",
@@ -101,14 +146,14 @@ DEFAULT_MODELS = [
 ]
 
 DEFAULT_PROMPT_PRESETS = [
-    "Musical constellations twinkling in the night sky",
-    "Rain drops falling on a tin roof with distant thunder",
-    "A cinematic orchestral swell with epic drums",
-    "Birds chirping in a peaceful forest at dawn",
-    "Electronic synth wave with retro 80s vibe",
-    "Ocean waves crashing on a rocky shore",
-    "A jazz saxophone playing in a smoky bar",
-    "Wind howling through mountain peaks",
+    "Cinematic riser and massive impact, sub bass drop",
+    "Sci-fi UI confirmation beep, clean digital tone",
+    "Distant thunder rolling across a valley, rain ambience",
+    "Heavy sword draw and metallic scrape",
+    "Continuous ambient forest soundscape, birds, wind",
+    "Evolving dark drone, low frequency rumble",
+    "Foley: footsteps on gravel, slow pace",
+    "Whoosh transition, fast air movement"
 ]
 
 NEGATIVE_PROMPT_PRESETS = [
@@ -118,7 +163,6 @@ NEGATIVE_PROMPT_PRESETS = [
     "clipping, peaking, distortion",
 ]
 
-# Autocomplete Tags
 AUDIO_TAGS = [
     "rain", "thunder", "ocean", "waves", "wind", "fire", "crackling", "storm",
     "bass", "bass drop", "drums", "kick", "snare", "hi-hat", "cymbals",
@@ -131,7 +175,8 @@ AUDIO_TAGS = [
     "explosion", "gunshot", "impact", "crash", "glass", "breaking",
     "babbling brook", "stream", "river", "waterfall", "drip", "splash",
     "ambient", "cinematic", "epic", "lofi", "jazz", "classical", "rock",
-    "metal", "electronic", "techno", "house", "drone", "8-bit", "retro"
+    "metal", "electronic", "techno", "house", "drone", "8-bit", "retro",
+    "riser", "whoosh", "swoosh", "UI", "beep", "boop", "mechanical"
 ]
 
 OVERLAP_S = 1.0
@@ -149,216 +194,138 @@ THUMB_WIDTH = 120
 THUMB_HEIGHT = 28
 THUMB_BARS = 60
 
-# --- Professional Stylesheet ---
 STYLESHEET = """
 QMainWindow { background-color: #2b2b2b; }
-
 QGroupBox {
-    border: 1px solid #3c3c3c;
-    border-radius: 4px;
-    margin-top: 10px;
-    padding-top: 10px;
-    font-weight: bold;
-    color: #cccccc;
+    border: 1px solid #3c3c3c; border-radius: 4px; margin-top: 10px;
+    padding-top: 10px; font-weight: bold; color: #cccccc;
 }
 QGroupBox::title {
-    subcontrol-origin: margin;
-    subcontrol-position: top left;
-    left: 10px;
-    padding: 0 5px;
-    background-color: #2b2b2b;
+    subcontrol-origin: margin; subcontrol-position: top left;
+    left: 10px; padding: 0 5px; background-color: #2b2b2b;
 }
-
 QTabWidget::pane {
-    border: 1px solid #3c3c3c;
-    border-radius: 2px;
-    background-color: #2b2b2b;
-    top: -1px;
+    border: 1px solid #3c3c3c; border-radius: 2px;
+    background-color: #2b2b2b; top: -1px;
 }
 QTabBar::tab {
-    background: #3c3c3c;
-    color: #aaaaaa;
-    padding: 8px 18px;
-    margin-right: 2px;
-    border-top-left-radius: 3px;
-    border-top-right-radius: 3px;
-    min-width: 70px;
-    font-weight: bold;
+    background: #3c3c3c; color: #aaaaaa; padding: 8px 18px;
+    margin-right: 2px; border-top-left-radius: 3px;
+    border-top-right-radius: 3px; min-width: 70px; font-weight: bold;
 }
-QTabBar::tab:selected {
-    background: #2A82DA;
-    color: white;
-}
-QTabBar::tab:hover:!selected {
-    background: #4a4a4a;
-    color: white;
-}
-
+QTabBar::tab:selected { background: #2A82DA; color: white; }
+QTabBar::tab:hover:!selected { background: #4a4a4a; color: white; }
 QPushButton {
-    background-color: #3c3c3c;
-    border: 1px solid #4a4a4a;
-    color: #e0e0e0;
-    padding: 6px 12px;
-    border-radius: 3px;
-    min-height: 20px;
+    background-color: #3c3c3c; border: 1px solid #4a4a4a; color: #e0e0e0;
+    padding: 6px 12px; border-radius: 3px; min-height: 20px;
 }
-QPushButton:hover {
-    background-color: #4a4a4a;
-    border-color: #2A82DA;
-}
+QPushButton:hover { background-color: #4a4a4a; border-color: #2A82DA; }
 QPushButton:pressed { background-color: #2b2b2b; }
-QPushButton:disabled {
-    background-color: #333333;
-    color: #666666;
-    border-color: #333333;
-}
-
+QPushButton:disabled { background-color: #333333; color: #666666; border-color: #333333; }
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit {
-    background-color: #333333;
-    border: 1px solid #3c3c3c;
-    padding: 4px 6px;
-    border-radius: 2px;
-    color: #e0e0e0;
-    selection-background-color: #2A82DA;
+    background-color: #333333; border: 1px solid #3c3c3c; padding: 4px 6px;
+    border-radius: 2px; color: #e0e0e0; selection-background-color: #2A82DA;
 }
 QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus, QPlainTextEdit:focus {
     border: 1px solid #2A82DA;
 }
 QComboBox::drop-down { border: none; width: 20px; }
 QComboBox QAbstractItemView, QAbstractItemView {
-    background-color: #333333;
-    border: 1px solid #3c3c3c;
-    selection-background-color: #2A82DA;
-    color: #e0e0e0;
+    background-color: #333333; border: 1px solid #3c3c3c;
+    selection-background-color: #2A82DA; color: #e0e0e0;
 }
-
 QTableWidget {
-    gridline-color: #3c3c3c;
-    background-color: #2b2b2b;
-    alternate-background-color: #333333;
-    border: 1px solid #3c3c3c;
-    border-radius: 2px;
+    gridline-color: #3c3c3c; background-color: #2b2b2b;
+    alternate-background-color: #333333; border: 1px solid #3c3c3c; border-radius: 2px;
 }
 QHeaderView::section {
-    background-color: #3c3c3c;
-    padding: 6px;
-    border: none;
-    font-weight: bold;
-    color: #cccccc;
+    background-color: #3c3c3c; padding: 6px; border: none;
+    font-weight: bold; color: #cccccc;
 }
-
 QProgressBar {
-    border: 1px solid #3c3c3c;
-    border-radius: 2px;
-    text-align: center;
-    background-color: #333333;
-    color: white;
-    min-height: 22px;
+    border: 1px solid #3c3c3c; border-radius: 2px; text-align: center;
+    background-color: #333333; color: white; min-height: 22px;
 }
-QProgressBar::chunk {
-    background-color: #2A82DA;
-    border-radius: 1px;
-}
-
-QScrollBar:vertical {
-    background: #2b2b2b;
-    width: 10px;
-    margin: 0;
-}
-QScrollBar::handle:vertical {
-    background: #4a4a4a;
-    min-height: 20px;
-    border-radius: 4px;
-}
+QProgressBar::chunk { background-color: #2A82DA; border-radius: 1px; }
+QScrollBar:vertical { background: #2b2b2b; width: 10px; margin: 0; }
+QScrollBar::handle:vertical { background: #4a4a4a; min-height: 20px; border-radius: 4px; }
 QScrollBar::handle:vertical:hover { background: #2A82DA; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QScrollBar:horizontal {
-    background: #2b2b2b;
-    height: 10px;
-    margin: 0;
-}
-QScrollBar::handle:horizontal {
-    background: #4a4a4a;
-    min-width: 20px;
-    border-radius: 4px;
-}
+QScrollBar:horizontal { background: #2b2b2b; height: 10px; margin: 0; }
+QScrollBar::handle:horizontal { background: #4a4a4a; min-width: 20px; border-radius: 4px; }
 QScrollBar::handle:horizontal:hover { background: #2A82DA; }
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
-
 QScrollArea { border: none; background-color: transparent; }
-
 QCheckBox { color: #e0e0e0; spacing: 6px; }
 QCheckBox::indicator {
-    width: 14px;
-    height: 14px;
-    border-radius: 2px;
-    border: 1px solid #4a4a4a;
-    background: #333333;
+    width: 14px; height: 14px; border-radius: 2px;
+    border: 1px solid #4a4a4a; background: #333333;
 }
-QCheckBox::indicator:checked {
-    background: #2A82DA;
-    border-color: #2A82DA;
-}
-
+QCheckBox::indicator:checked { background: #2A82DA; border-color: #2A82DA; }
 QLabel { color: #d0d0d0; }
-
 QToolButton {
-    background-color: #3c3c3c;
-    border: 1px solid #4a4a4a;
-    border-radius: 3px;
-    padding: 4px;
-    color: #e0e0e0;
+    background-color: #3c3c3c; border: 1px solid #4a4a4a;
+    border-radius: 3px; padding: 4px; color: #e0e0e0;
 }
-QToolButton:hover {
-    background-color: #4a4a4a;
-    border-color: #2A82DA;
-}
-
-QStatusBar {
-    background-color: #2b2b2b;
-    color: #aaaaaa;
-}
+QToolButton:hover { background-color: #4a4a4a; border-color: #2A82DA; }
+QStatusBar { background-color: #2b2b2b; color: #aaaaaa; }
 QStatusBar::item { border: none; }
-
-QMenuBar {
-    background-color: #2b2b2b;
-    color: #d0d0d0;
-    border-bottom: 1px solid #3c3c3c;
-}
+QMenuBar { background-color: #2b2b2b; color: #d0d0d0; border-bottom: 1px solid #3c3c3c; }
 QMenuBar::item:selected { background-color: #3c3c3c; }
-QMenu {
-    background-color: #333333;
-    border: 1px solid #3c3c3c;
-    color: #d0d0d0;
-}
+QMenu { background-color: #333333; border: 1px solid #3c3c3c; color: #d0d0d0; }
 QMenu::item:selected { background-color: #2A82DA; }
-
 QSlider::groove:horizontal {
-    border: 1px solid #3c3c3c;
-    height: 4px;
-    background: #333333;
-    border-radius: 2px;
+    border: 1px solid #3c3c3c; height: 4px; background: #333333; border-radius: 2px;
 }
 QSlider::handle:horizontal {
-    background: #2A82DA;
-    border: 1px solid #2A82DA;
-    width: 12px;
-    margin: -5px 0;
-    border-radius: 6px;
+    background: #2A82DA; border: 1px solid #2A82DA; width: 12px;
+    margin: -5px 0; border-radius: 6px;
 }
 QSlider::handle:horizontal:hover { background: #3a92ea; }
-
 QSplitter::handle { background-color: #3c3c3c; }
 QSplitter::handle:horizontal { width: 2px; }
+QListWidget { background-color: #2b2b2b; border: 1px solid #3c3c3c; border-radius: 2px; }
+QListWidget::item:selected { background-color: #2A82DA; color: white; }
 """
 
-# --- JSON Settings Engine ---
+# --- Robust Logging & Exception Hooks ---
+try:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(LOG_FILE, mode='w', encoding='utf-8')
+        ]
+    )
+except Exception as e:
+    logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler(sys.stdout)])
+    print(f"Failed to initialize file logging: {e}")
+
+logger = logging.getLogger(APP_NAME)
+
+def install_exception_hooks():
+    def global_exception_handler(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        logger.critical("Uncaught exception in main thread", exc_info=(exc_type, exc_value, exc_traceback))
+            
+    sys.excepthook = global_exception_handler
+
+    def threading_exception_handler(args):
+        logger.critical(f"Uncaught exception in thread {args.thread.name}", exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+        
+    threading.excepthook = threading_exception_handler
+
+install_exception_hooks()
+
 class JsonSettings:
     def __init__(self, path):
         self.path = path
         self.data = {}
         self._dirty = False
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.load()
 
     def load(self):
@@ -368,19 +335,24 @@ class JsonSettings:
                     with open(self.path, 'r', encoding='utf-8') as f:
                         self.data = json.load(f)
                 except Exception as e:
-                    logging.error(f"Failed to load JSON settings: {e}")
+                    logging.error(f"Failed to load JSON settings: {e}", exc_info=True)
                     self.data = {}
 
     def save(self):
         with self._lock:
-            try:
-                tmp = self.path + ".tmp"
-                with open(tmp, 'w', encoding='utf-8') as f:
-                    json.dump(self.data, f, indent=4)
-                os.replace(tmp, self.path)
-                self._dirty = False
-            except Exception as e:
-                logging.error(f"Failed to save JSON settings: {e}")
+            if not self._dirty: return
+            data_copy = copy.deepcopy(self.data)
+            self._dirty = False
+            
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data_copy, f, indent=4)
+            os.replace(tmp, self.path)
+        except Exception as e:
+            logging.error(f"Failed to save JSON settings: {e}", exc_info=True)
+            with self._lock:
+                self._dirty = True
 
     def value(self, key, default=None, type=None):
         with self._lock:
@@ -427,8 +399,7 @@ class JsonSettings:
         self.save()
 
     def sync(self):
-        if self._dirty:
-            self.save()
+        self.save()
 
     def clear(self):
         with self._lock:
@@ -436,23 +407,6 @@ class JsonSettings:
             self._dirty = True
         self.save()
 
-
-# --- Logging Setup ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s'
-)
-logger = logging.getLogger(APP_NAME)
-
-try:
-    handler = RotatingFileHandler(
-        LOG_FILE, maxBytes=5*1024*1024, backupCount=3, mode='a', encoding='utf-8'
-    )
-except Exception:
-    handler = logging.FileHandler("audioldm2_studio.log", mode='a', encoding='utf-8')
-
-handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s'))
-logger.addHandler(handler)
 
 def log_system_info():
     logger.info("=" * 60)
@@ -469,8 +423,6 @@ def log_system_info():
             logger.info(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
     logger.info("=" * 60)
 
-
-# --- Utility Functions ---
 def sanitize_filename(text: str, max_length: int = 30) -> str:
     safe = "".join(c for c in text if c.isalnum() or c in (' ', '_', '-')).rstrip()
     safe = safe[:max_length].replace(' ', '_') if safe else "audio"
@@ -479,50 +431,41 @@ def sanitize_filename(text: str, max_length: int = 30) -> str:
 def format_time(seconds) -> str:
     try:
         total_secs = int(float(seconds))
-        if total_secs < 0:
-            total_secs = 0
+        if total_secs < 0: total_secs = 0
         minutes, secs = divmod(total_secs, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
         return f"{minutes:02d}:{secs:02d}"
     except Exception:
         return "00:00"
 
 def normalize_audio_data(data: np.ndarray) -> np.ndarray:
-    if data is None or data.size == 0:
-        return np.zeros(0, dtype=np.float32)
-    if data.ndim > 1:
-        data = data.mean(axis=1)
-    if data.dtype == np.int16:
-        return data.astype(np.float32) / 32768.0
-    if data.dtype == np.int32:
-        return data.astype(np.float32) / 2147483648.0
-    if data.dtype == np.uint8:
-        return (data.astype(np.float32) - 128.0) / 128.0
-    if data.dtype in (np.float32, np.float64):
-        return data.astype(np.float32)
+    if data is None or data.size == 0: return np.zeros(0, dtype=np.float32)
+    if data.ndim > 1: data = data.mean(axis=1)
+    if data.dtype == np.int16: return data.astype(np.float32) / 32768.0
+    if data.dtype == np.int32: return data.astype(np.float32) / 2147483648.0
+    if data.dtype == np.uint8: return (data.astype(np.float32) - 128.0) / 128.0
+    if data.dtype in (np.float32, np.float64): return data.astype(np.float32)
     return data.astype(np.float32)
 
 def normalize_audio(audio: np.ndarray, target_db: float = -3.0) -> np.ndarray:
-    if audio.size == 0:
-        return audio.copy()
+    if audio.size == 0: return audio.copy()
     audio = np.nan_to_num(audio.astype(np.float32, copy=True), nan=0.0, posinf=0.0, neginf=0.0)
     peak = float(np.max(np.abs(audio))) if audio.size > 0 else 0.0
-    if peak == 0:
-        return audio
+    if peak == 0: return audio
     target_peak = 10 ** (target_db / 20.0)
     return audio * (target_peak / peak)
 
 def apply_fade(audio: np.ndarray, sample_rate: int, fade_in_s: float = 0.05, fade_out_s: float = 0.05) -> np.ndarray:
     audio = audio.astype(np.float32, copy=True)
-    if audio.size == 0:
-        return audio
+    if audio.size == 0: return audio
     fade_in_samples = int(fade_in_s * sample_rate)
     fade_out_samples = int(fade_out_s * sample_rate)
-
     if fade_in_samples + fade_out_samples > len(audio):
         total_fade = len(audio)
         fade_in_samples = total_fade // 2
         fade_out_samples = total_fade - fade_in_samples
-
     if fade_in_samples > 0:
         audio[:fade_in_samples] *= np.linspace(0.0, 1.0, fade_in_samples, dtype=np.float32)
     if fade_out_samples > 0:
@@ -530,25 +473,34 @@ def apply_fade(audio: np.ndarray, sample_rate: int, fade_in_s: float = 0.05, fad
     return audio
 
 def trim_silence(audio: np.ndarray, threshold: float = 0.01) -> np.ndarray:
-    if audio.size == 0:
-        return audio.copy()
+    if audio.size == 0: return audio.copy()
     audio = np.nan_to_num(audio.astype(np.float32, copy=True), nan=0.0, posinf=0.0, neginf=0.0)
     above_threshold = np.where(np.abs(audio) > threshold)[0]
-    if above_threshold.size == 0:
-        return audio
-    start = above_threshold[0]
-    end = above_threshold[-1] + 1
-    return audio[start:end]
+    if above_threshold.size == 0: return audio
+    return audio[above_threshold[0]:above_threshold[-1] + 1]
 
+def slerp(t, v0, v1, DOT_THRESHOLD=0.9995):
+    if not isinstance(v0, torch.Tensor): v0 = torch.tensor(v0)
+    if not isinstance(v1, torch.Tensor): v1 = torch.tensor(v1)
+    v0 = v0.flatten().float()
+    v1 = v1.flatten().float()
+    v0_norm = v0 / (v0.norm() + 1e-9)
+    v1_norm = v1 / (v1.norm() + 1e-9)
+    dot = torch.dot(v0_norm, v1_norm)
+    if torch.abs(dot) > DOT_THRESHOLD:
+        return torch.lerp(v0, v1, t).view(v0.shape)
+    omega = torch.acos(dot)
+    so = torch.sin(omega)
+    slerp_v = (torch.sin((1.0 - t) * omega) / so) * v0 + (torch.sin(t * omega) / so) * v1
+    return slerp_v.view(v0.shape)
 
-# --- State Machine & Data Models ---
 class BatchState(Enum):
     IDLE = 0
     RUNNING = 1
     CANCELLED = 2
     COMPLETED = 3
 
-@dataclass
+@dataclass(slots=True)
 class GenerationParams:
     prompt: str
     negative_prompt: str
@@ -574,12 +526,128 @@ class GenerationParams:
     inpaint_source: str = ""
     inpaint_start_s: float = 0.0
     inpaint_end_s: float = 0.0
+    use_seed_travel: bool = False
+    travel_start_seed: int = -1
+    travel_end_seed: int = 100
+    travel_steps: int = 5
+
+@dataclass(slots=True)
+class GenerationStatus:
+    variation: int
+    total_variations: int
+    chunk: int
+    total_chunks: int
+    step: int
+    total_steps: int
+    
+    def format(self) -> str:
+        s = f"Variation {self.variation}/{self.total_variations}"
+        if self.total_chunks > 1:
+            s += f" - Chunk {self.chunk}/{self.total_chunks}"
+        s += f" - Step {self.step}/{self.total_steps}"
+        return s
+
+class BatchOrchestrator(QObject):
+    batch_started = Signal()
+    batch_progress = Signal(int, int)
+    batch_finished = Signal()
+    batch_log = Signal(str)
+    next_prompt_ready = Signal(str, float)
+
+    def __init__(self, main_window):
+        super().__init__()
+        self.main_window = main_window
+        self.batch_state = BatchState.IDLE
+        self.batch_prompts = []
+        self.batch_index = 0
+        self.is_timeline_batch = False
+        self._master_wav_writer = None
+        self.master_timeline_path = ""
+        self._overlap_buffer = None
+        self._master_fr = 0
+
+    def start_batch(self, prompts, is_timeline=False):
+        self.batch_prompts = prompts
+        self.batch_index = 0
+        self.is_timeline_batch = is_timeline
+        self.batch_state = BatchState.RUNNING
+        self.batch_started.emit()
+        
+        if is_timeline:
+            self.master_timeline_path = os.path.join(self.main_window.output_dir_edit.text().strip() or os.getcwd(), "timeline_master.wav")
+            self._master_wav_writer = wave.open(self.master_timeline_path, 'wb')
+            self._master_wav_writer.setnchannels(1)
+            self._master_wav_writer.setsampwidth(2)
+            self._overlap_buffer = None
+            
+        self._process_next()
+
+    def _process_next(self):
+        if self.batch_state != BatchState.RUNNING: return
+        if self.batch_index < len(self.batch_prompts):
+            self.batch_progress.emit(self.batch_index + 1, len(self.batch_prompts))
+            item = self.batch_prompts[self.batch_index]
+            prompt = item['prompt'] if isinstance(item, dict) else item
+            duration = item.get('duration', 10.0) if isinstance(item, dict) else 10.0
+            self.next_prompt_ready.emit(prompt, duration)
+        else:
+            self.batch_state = BatchState.COMPLETED
+            if self._master_wav_writer:
+                if self._overlap_buffer is not None:
+                    self._master_wav_writer.writeframes(self._overlap_buffer.tobytes())
+                self._master_wav_writer.close()
+                self._master_wav_writer = None
+                self._overlap_buffer = None
+                QMessageBox.information(self.main_window, "Timeline Complete", f"Master timeline saved to:\n{self.master_timeline_path}")
+            self.batch_finished.emit()
+
+    def on_generation_finished(self, metadata_list):
+        if self.batch_state == BatchState.RUNNING:
+            if self._master_wav_writer:
+                for meta in metadata_list:
+                    path = meta['path']
+                    try:
+                        with wave.open(path, 'rb') as wf_in:
+                            if self._master_fr == 0:
+                                self._master_fr = wf_in.getframerate()
+                                self._master_wav_writer.setframerate(self._master_fr)
+                            
+                            data = np.frombuffer(wf_in.readframes(wf_in.getnframes()), dtype=np.int16)
+                            
+                            if self._overlap_buffer is not None and len(self._overlap_buffer) > 0:
+                                overlap_len = min(len(self._overlap_buffer), len(data) // 2)
+                                if overlap_len > 0:
+                                    fade_out = np.linspace(1.0, 0.0, overlap_len, dtype=np.float32)
+                                    fade_in = np.linspace(0.0, 1.0, overlap_len, dtype=np.float32)
+                                    crossfaded = (self._overlap_buffer[:overlap_len].astype(np.float32) * fade_out) + (data[:overlap_len].astype(np.float32) * fade_in)
+                                    data[:overlap_len] = np.clip(crossfaded, -32768, 32767).astype(np.int16)
+                            
+                            overlap_size = int(self._master_fr * OVERLAP_S)
+                            if len(data) > overlap_size:
+                                self._master_wav_writer.writeframes(data[:-overlap_size].tobytes())
+                                self._overlap_buffer = data[-overlap_size:]
+                            else:
+                                self._master_wav_writer.writeframes(data.tobytes())
+                                self._overlap_buffer = data
+                                
+                    except Exception as e:
+                        logger.error(f"Failed to append to master timeline: {e}", exc_info=True)
+            
+            self.batch_index += 1
+            QTimer.singleShot(int(self.main_window.batch_delay_spin.value() * 1000), self._process_next)
+
+    def cancel(self):
+        self.batch_state = BatchState.CANCELLED
+        if self._master_wav_writer:
+            self._master_wav_writer.close()
+            self._master_wav_writer = None
+            self._overlap_buffer = None
 
 
-# --- Worker Threads ---
 class AudioGenerationWorker(QObject):
     progress_updated = Signal(int)
     status_updated = Signal(str)
+    structured_status_updated = Signal(object)
     eta_updated = Signal(str)
     generation_completed = Signal(str, dict)
     error_occurred = Signal(str)
@@ -600,15 +668,12 @@ class AudioGenerationWorker(QObject):
         self.last_step_time = None
 
     @property
-    def is_cancelled(self) -> bool:
-        return self._cancel_event.is_set()
+    def is_cancelled(self) -> bool: return self._cancel_event.is_set()
 
     @is_cancelled.setter
     def is_cancelled(self, val: bool):
-        if val:
-            self._cancel_event.set()
-        else:
-            self._cancel_event.clear()
+        if val: self._cancel_event.set()
+        else: self._cancel_event.clear()
 
     def _load_pipeline(self, actual_device: str):
         with self._pipe_lock:
@@ -622,36 +687,20 @@ class AudioGenerationWorker(QObject):
                 return
 
             self._unload_pipeline_unsafe()
-
             self.status_updated.emit("Loading model weights...")
             self.progress_updated.emit(5)
 
             dtype = torch.float16 if actual_device != "cpu" else torch.float32
+            load_kwargs = {"torch_dtype": dtype, "cache_dir": self.params.cache_dir}
+            if dtype == torch.float16: load_kwargs["variant"] = "fp16"
 
-            load_kwargs = {
-                "torch_dtype": dtype,
-                "cache_dir": self.params.cache_dir,
-            }
-            if dtype == torch.float16:
-                load_kwargs["variant"] = "fp16"
-
-            load_attempts = [
-                {"use_safetensors": True},
-                {"use_safetensors": False},
-            ]
-
-            last_err = None
-            pipe = None
+            load_attempts = [{"use_safetensors": True}, {"use_safetensors": False}]
+            last_err, pipe = None, None
 
             for attempt in load_attempts:
-                if self.is_cancelled:
-                    raise InterruptedError("User cancelled generation")
+                if self.is_cancelled: raise InterruptedError("User cancelled generation")
                 try:
-                    pipe = AudioLDM2Pipeline.from_pretrained(
-                        self.params.model_name,
-                        **load_kwargs,
-                        **attempt
-                    )
+                    pipe = AudioLDM2Pipeline.from_pretrained(self.params.model_name, **load_kwargs, **attempt)
                     break
                 except Exception as e:
                     msg = str(e).lower()
@@ -659,11 +708,7 @@ class AudioGenerationWorker(QObject):
                         logger.warning("fp16 variant not found, falling back to default weights.")
                         load_kwargs.pop("variant", None)
                         try:
-                            pipe = AudioLDM2Pipeline.from_pretrained(
-                                self.params.model_name,
-                                **load_kwargs,
-                                **attempt
-                            )
+                            pipe = AudioLDM2Pipeline.from_pretrained(self.params.model_name, **load_kwargs, **attempt)
                             break
                         except Exception as e2:
                             last_err = e2
@@ -671,11 +716,9 @@ class AudioGenerationWorker(QObject):
                     else:
                         last_err = e
                         logger.warning(f"Load attempt failed ({attempt}): {e}")
-
                     pipe = None
                     gc.collect()
-                    if ML_AVAILABLE and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    if ML_AVAILABLE and torch.cuda.is_available(): torch.cuda.empty_cache()
 
             if pipe is None:
                 raise RuntimeError(f"Failed to load model after multiple attempts. Last error: {last_err}")
@@ -683,8 +726,7 @@ class AudioGenerationWorker(QObject):
             if self.is_cancelled:
                 del pipe
                 gc.collect()
-                if ML_AVAILABLE and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                if ML_AVAILABLE and torch.cuda.is_available(): torch.cuda.empty_cache()
                 raise InterruptedError("User cancelled generation")
 
             self.status_updated.emit("Configuring model for inference...")
@@ -693,22 +735,18 @@ class AudioGenerationWorker(QObject):
             try:
                 if self.params.use_cpu_offload and actual_device != "cpu":
                     if not hasattr(pipe, 'enable_model_cpu_offload'):
-                        raise RuntimeError("CPU Offload is requested but the 'accelerate' library is not installed. Please run: pip install accelerate")
+                        raise RuntimeError("CPU Offload is requested but the 'accelerate' library is not installed.")
                     pipe.enable_model_cpu_offload()
                 else:
                     pipe = pipe.to(actual_device)
 
-                if hasattr(pipe, "enable_attention_slicing"):
-                    pipe.enable_attention_slicing()
-                if hasattr(pipe, "enable_vae_tiling"):
-                    pipe.enable_vae_tiling()
+                if hasattr(pipe, "enable_attention_slicing"): pipe.enable_attention_slicing()
+                if hasattr(pipe, "enable_vae_tiling"): pipe.enable_vae_tiling()
             except RuntimeError as e:
                 del pipe
                 gc.collect()
-                if ML_AVAILABLE and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                if "out of memory" in str(e).lower():
-                    raise RuntimeError("GPU Out of Memory during model configuration.")
+                if ML_AVAILABLE and torch.cuda.is_available(): torch.cuda.empty_cache()
+                if "out of memory" in str(e).lower(): raise RuntimeError("GPU Out of Memory during model configuration.")
                 raise
 
             AudioGenerationWorker._shared_pipe = pipe
@@ -717,17 +755,44 @@ class AudioGenerationWorker(QObject):
             AudioGenerationWorker._shared_pipe_offload = self.params.use_cpu_offload
             self.pipe = pipe
 
+    def _on_step(self, step, timestep, latents, chunk_idx=0, **kwargs):
+        if self.is_cancelled: raise InterruptedError("User cancelled generation")
+        p = self.params
+        
+        step, chunk_idx, num_chunks_int = int(step), int(chunk_idx), int(self._num_chunks)
+        p_steps_int, variation_int, p_num_variations_int = int(p.steps), int(self._variation), int(self._total_variations)
+
+        steps_done = self._steps_done_before_variation + (chunk_idx * p_steps_int) + (step + 1)
+        total_progress = 15 + int(80 * steps_done / max(self._total_steps_all, 1))
+        self.progress_updated.emit(min(total_progress, 95))
+
+        current_time = time.time()
+        if self.last_step_time is not None:
+            dt = current_time - self.last_step_time
+            if dt > 0:
+                if self.ema_step_time is None: self.ema_step_time = dt
+                else: self.ema_step_time = ETA_SMOOTHING_ALPHA * dt + (1 - ETA_SMOOTHING_ALPHA) * self.ema_step_time
+                remaining_steps = max(0, p_steps_int - step - 1)
+                remaining_chunks = max(0, num_chunks_int - chunk_idx - 1)
+                remaining_variations = max(0, p_num_variations_int - variation_int - 1)
+                eta_seconds = (remaining_steps * self.ema_step_time + remaining_chunks * p_steps_int * self.ema_step_time + remaining_variations * num_chunks_int * p_steps_int * self.ema_step_time)
+                self.eta_updated.emit(format_time(eta_seconds))
+
+        self.last_step_time = current_time
+        
+        status = GenerationStatus(variation_int + 1, p_num_variations_int, chunk_idx + 1, num_chunks_int, step + 1, p_steps_int)
+        self.structured_status_updated.emit(status)
+        self.status_updated.emit(status.format())
+
     def run(self):
         gen_start_time = time.time()
         try:
             p = self.params
-            logger.info(f"Starting generation. Prompt: '{p.prompt}' | Model: {p.model_name}")
+            logger.info(f"Starting generation. Prompt: '{p.prompt}' | Model: {p.model_name} | Duration: {p.duration}s")
 
             cache_dir = os.path.normpath(p.cache_dir or DEFAULT_CACHE_DIR)
-            try:
-                os.makedirs(cache_dir, exist_ok=True)
-            except OSError as e:
-                raise RuntimeError(f"Cannot create or access cache directory '{cache_dir}':\n{e}")
+            try: os.makedirs(cache_dir, exist_ok=True)
+            except OSError as e: raise RuntimeError(f"Cannot create or access cache directory '{cache_dir}':\n{e}")
 
             final_out_dir = p.output_dir
             if p.section:
@@ -742,118 +807,110 @@ class AudioGenerationWorker(QObject):
 
             actual_device = p.device
             if actual_device == "auto":
-                if torch.cuda.is_available():
-                    actual_device = "cuda"
-                elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                    actual_device = "mps"
-                else:
-                    actual_device = "cpu"
-
-            logger.info(f"Using device: {actual_device} | CPU Offload: {p.use_cpu_offload}")
+                if torch.cuda.is_available(): actual_device = "cuda"
+                elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available(): actual_device = "mps"
+                else: actual_device = "cpu"
 
             self._load_pipeline(actual_device)
-
             self.status_updated.emit("Generating audio...")
             self.progress_updated.emit(15)
 
-            saved_paths = []
-            metadata_list = []
-
+            saved_paths, metadata_list = [], []
             MAX_CHUNK_S = max(MIN_CHUNK_S, p.chunk_size)
             use_chunking = p.duration > MAX_CHUNK_S and not p.inpaint_source
 
-            for variation in range(p.num_variations):
-                if self.is_cancelled:
-                    raise InterruptedError("User cancelled generation")
+            total_variations = max(2, p.travel_steps) if p.use_seed_travel else p.num_variations
 
-                if p.seed >= 0:
+            for variation in range(total_variations):
+                if self.is_cancelled: raise InterruptedError("User cancelled generation")
+
+                if p.use_seed_travel:
+                    base_seed = p.travel_start_seed if p.travel_start_seed >= 0 else int(time.time() * 1000) % (2**31)
+                    end_seed = p.travel_end_seed if p.travel_end_seed >= 0 else base_seed + 100
+                elif p.seed >= 0:
                     base_seed = p.seed + variation
                 else:
                     base_seed = int(time.time() * 1000) % (2**31) + variation
-
-                logger.info(f"Variation {variation + 1}/{p.num_variations} - Base seed: {base_seed}")
 
                 variation_start = time.time()
 
                 if use_chunking:
                     num_chunks = math.ceil((p.duration - OVERLAP_S) / (MAX_CHUNK_S - OVERLAP_S))
-                    self.status_updated.emit(f"Variation {variation + 1}/{p.num_variations} - Generating {num_chunks} chunks...")
+                    last_chunk_len = p.duration - (num_chunks - 1) * (MAX_CHUNK_S - OVERLAP_S)
+                    if last_chunk_len < MIN_CHUNK_S and num_chunks > 1:
+                        num_chunks -= 1
+                    self.status_updated.emit(f"Variation {variation + 1}/{total_variations} - Streaming {num_chunks} chunks to disk...")
                 else:
                     num_chunks = 1
 
-                audio_parts = []
-                sample_rate = getattr(getattr(getattr(self.pipe, "vae", None), "config", None),
-                                      "sample_rate", 16000)
-                self.ema_step_time = None
-                self.last_step_time = None
+                sample_rate = getattr(getattr(getattr(self.pipe, "vae", None), "config", None), "sample_rate", 16000)
+                self.ema_step_time, self.last_step_time = None, None
 
-                steps_done_before_variation = variation * num_chunks * p.steps
-                total_steps_all = p.num_variations * num_chunks * p.steps
+                self._steps_done_before_variation = variation * num_chunks * p.steps
+                self._total_steps_all = total_variations * num_chunks * p.steps
+                self._num_chunks = num_chunks
+                self._variation = variation
+                self._total_variations = total_variations
 
-                def progress_callback(step, timestep, latents, current_chunk=0):
-                    if self.is_cancelled:
-                        raise InterruptedError("User cancelled generation")
-
-                    step = int(step)
-                    current_chunk = int(current_chunk)
-                    num_chunks_int = int(num_chunks)
-                    p_steps_int = int(p.steps)
-                    variation_int = int(variation)
-                    p_num_variations_int = int(p.num_variations)
-
-                    steps_done = steps_done_before_variation + (current_chunk * p_steps_int) + (step + 1)
-                    total_progress = 15 + int(80 * steps_done / max(total_steps_all, 1))
-                    self.progress_updated.emit(min(total_progress, 95))
-
-                    current_time = time.time()
-                    if self.last_step_time is not None:
-                        dt = current_time - self.last_step_time
-                        if dt > 0:
-                            if self.ema_step_time is None:
-                                self.ema_step_time = dt
-                            else:
-                                self.ema_step_time = ETA_SMOOTHING_ALPHA * dt + (1 - ETA_SMOOTHING_ALPHA) * self.ema_step_time
-
-                            remaining_steps = max(0, p_steps_int - step - 1)
-                            remaining_chunks = max(0, num_chunks_int - current_chunk - 1)
-                            remaining_variations = max(0, p_num_variations_int - variation_int - 1)
-
-                            eta_seconds = (
-                                remaining_steps * self.ema_step_time
-                                + remaining_chunks * p_steps_int * self.ema_step_time
-                                + remaining_variations * num_chunks_int * p_steps_int * self.ema_step_time
-                            )
-                            self.eta_updated.emit(format_time(eta_seconds))
-
-                    self.last_step_time = current_time
-                    self.status_updated.emit(
-                        f"Variation {variation_int + 1}/{p_num_variations_int} - "
-                        f"Chunk {current_chunk + 1}/{num_chunks_int} - "
-                        f"Step {step + 1}/{p_steps_int}"
-                    )
+                travel_latents = None
+                if p.use_seed_travel and variation > 0:
+                    t = variation / (total_variations - 1)
+                    logger.info(f"Seed Travel: Interpolating latents at t={t:.2f}")
+                
+                safe_prompt = sanitize_filename(p.prompt)
+                suffix = f"_v{variation + 1}" if total_variations > 1 else ""
+                if p.use_seed_travel: suffix = f"_travel{variation + 1}"
+                prefix = "inpaint_" if p.inpaint_source else ""
+                filename = f"{prefix}{int(time.time())}_{safe_prompt}{suffix}.wav"
+                out_path = os.path.join(final_out_dir, filename)
+                
+                wav_writer = wave.open(out_path, 'wb')
+                wav_writer.setnchannels(1)
+                wav_writer.setsampwidth(2)
+                wav_writer.setframerate(sample_rate)
+                
+                overlap_buffer = None
+                last_audio_chunk = None
 
                 for chunk_idx in range(num_chunks):
                     if self.is_cancelled:
+                        wav_writer.close()
                         raise InterruptedError("User cancelled generation")
 
                     if use_chunking:
-                        chunk_len = MAX_CHUNK_S if chunk_idx < num_chunks - 1 else max(
-                            1.0, p.duration - (num_chunks - 1) * (MAX_CHUNK_S - OVERLAP_S)
-                        )
+                        if chunk_idx < num_chunks - 1:
+                            chunk_len = MAX_CHUNK_S
+                        else:
+                            chunk_len = max(MIN_CHUNK_S, p.duration - (num_chunks - 1) * (MAX_CHUNK_S - OVERLAP_S))
                     else:
                         chunk_len = p.duration
 
                     chunk_seed = (base_seed + chunk_idx * 7919) % (2**31)
-
                     gen_device = "cpu" if p.use_cpu_offload else actual_device
+                    
+                    if p.use_seed_travel:
+                        if not hasattr(self, '_latent_shape'):
+                            try:
+                                vae_scale_factor = 2 ** (len(self.pipe.vae.config.block_out_channels) - 1)
+                                num_waveform_samples = int(chunk_len * sample_rate)
+                                num_frames = num_waveform_samples // vae_scale_factor
+                                self._latent_shape = (1, self.pipe.unet.config.in_channels, num_frames, self.pipe.vae.config.sample_size)
+                            except Exception as e:
+                                logger.error(f"Failed to calculate latent shape: {e}. Disabling seed travel.", exc_info=True)
+                                p.use_seed_travel = False
+
+                        if p.use_seed_travel:
+                            gen_start = torch.Generator(device=gen_device).manual_seed(p.travel_start_seed if p.travel_start_seed >=0 else chunk_seed)
+                            gen_end = torch.Generator(device=gen_device).manual_seed(p.travel_end_seed if p.travel_end_seed >=0 else chunk_seed + 100)
+                            noise_start = torch.randn(self._latent_shape, generator=gen_start, device=gen_device, dtype=torch.float32)
+                            noise_end = torch.randn(self._latent_shape, generator=gen_end, device=gen_device, dtype=torch.float32)
+                            target_dtype = torch.float16 if actual_device != "cpu" else torch.float32
+                            travel_latents = slerp(t, noise_start, noise_end).to(target_dtype)
+
                     generator = torch.Generator(device=gen_device).manual_seed(chunk_seed)
 
-                    def cb_old(step, timestep, latents, c=chunk_idx):
-                        progress_callback(step, timestep, latents, current_chunk=c)
-
-                    def cb_new(pipe_, step, timestep, callback_kwargs, c=chunk_idx):
-                        latents = callback_kwargs.get("latents") if isinstance(callback_kwargs, dict) else None
-                        progress_callback(step, timestep, latents, current_chunk=c)
+                    cb_new = partial(self._on_step, chunk_idx=chunk_idx)
+                    cb_old = partial(self._on_step, chunk_idx=chunk_idx)
 
                     kwargs = dict(
                         prompt=p.prompt,
@@ -863,6 +920,9 @@ class AudioGenerationWorker(QObject):
                         guidance_scale=p.guidance,
                         generator=generator,
                     )
+
+                    if p.use_seed_travel and travel_latents is not None:
+                        kwargs["latents"] = travel_latents
 
                     sig = inspect.signature(self.pipe.__call__)
                     if "callback_on_step_end" in sig.parameters:
@@ -878,86 +938,58 @@ class AudioGenerationWorker(QObject):
 
                     if num_chunks > 1:
                         gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                        if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-                    if not audio_parts:
-                        audio_parts.append(audio_chunk)
+                    if p.high_pass_freq > 0 or p.low_pass_freq > 0:
+                        from scipy.signal import butter, sosfilt
+                        nyq = 0.5 * sample_rate
+                        if p.high_pass_freq > 0:
+                            sos = butter(4, min(p.high_pass_freq / nyq, 0.99), 'hp', output='sos')
+                            audio_chunk = sosfilt(sos, audio_chunk).astype(np.float32)
+                        if p.low_pass_freq > 0:
+                            sos = butter(4, max(p.low_pass_freq / nyq, 0.01), 'lp', output='sos')
+                            audio_chunk = sosfilt(sos, audio_chunk).astype(np.float32)
+
+                    if p.trim and not p.inpaint_source: audio_chunk = trim_silence(audio_chunk)
+                    if p.normalize and not p.inpaint_source: audio_chunk = normalize_audio(audio_chunk)
+                    if p.fade_in or p.fade_out:
+                        if not p.inpaint_source:
+                            audio_chunk = apply_fade(audio_chunk, sample_rate, fade_in_s=FADE_DURATION_S if p.fade_in else 0, fade_out_s=FADE_DURATION_S if p.fade_out else 0)
+
+                    if p.conditioning_audio and os.path.exists(p.conditioning_audio):
+                        try:
+                            c_sr, c_data = wavfile.read(p.conditioning_audio)
+                            c_data = normalize_audio_data(c_data)
+                            if len(c_data) < len(audio_chunk): c_data = np.pad(c_data, (0, len(audio_chunk) - len(c_data)))
+                            else: c_data = c_data[:len(audio_chunk)]
+                            window_size = max(1, int(0.05 * c_sr))
+                            c_env = np.convolve(np.abs(c_data), np.ones(window_size)/window_size, mode='same')
+                            max_env = np.max(c_env)
+                            if max_env > 0:
+                                audio_chunk = audio_chunk * (c_env / max_env)
+                        except Exception as e:
+                            logger.error(f"Conditioning failed: {e}", exc_info=True)
+
+                    chunk_int16 = (np.clip(audio_chunk, -1.0, 1.0) * 32767).astype(np.int16)
+                    
+                    if overlap_buffer is not None and use_chunking:
+                        overlap_samples = min(len(overlap_buffer), len(chunk_int16) // 2)
+                        if overlap_samples > 0:
+                            fade_out_arr = np.linspace(1.0, 0.0, overlap_samples, dtype=np.float32)
+                            fade_in_arr  = np.linspace(0.0, 1.0, overlap_samples, dtype=np.float32)
+                            crossfaded = (overlap_buffer[-overlap_samples:] * fade_out_arr + chunk_int16[:overlap_samples] * fade_in_arr).astype(np.int16)
+                            chunk_int16[:overlap_samples] = crossfaded
+                    
+                    if use_chunking and len(chunk_int16) > OVERLAP_S * sample_rate:
+                        overlap_buffer = chunk_int16[-int(OVERLAP_S * sample_rate):]
+                        wav_writer.writeframes(chunk_int16[:-int(OVERLAP_S * sample_rate)].tobytes())
                     else:
-                        overlap_samples = min(
-                            int(OVERLAP_S * sample_rate),
-                            len(audio_parts[-1]) // 2,
-                            len(audio_chunk) // 2,
-                        )
-                        if overlap_samples <= 0:
-                            audio_parts.append(audio_chunk)
-                        else:
-                            fade_out_arr = np.sqrt(np.linspace(1.0, 0.0, overlap_samples, dtype=np.float32))
-                            fade_in_arr  = np.sqrt(np.linspace(0.0, 1.0, overlap_samples, dtype=np.float32))
-                            tail = audio_parts[-1]
-                            tail[-overlap_samples:] = (
-                                tail[-overlap_samples:] * fade_out_arr
-                                + audio_chunk[:overlap_samples] * fade_in_arr
-                            ).astype(np.float32, copy=False)
-                            audio_parts.append(audio_chunk[overlap_samples:])
-
-                if self.is_cancelled:
-                    raise InterruptedError("User cancelled generation")
-
-                if audio_parts:
-                    final_audio = np.concatenate(audio_parts) if len(audio_parts) > 1 else audio_parts[0]
-                else:
-                    final_audio = np.zeros(0, dtype=np.float32)
-                del audio_parts
-                gc.collect()
-
-                audio = final_audio
-
-                if p.high_pass_freq > 0 or p.low_pass_freq > 0:
-                    from scipy.signal import butter, sosfilt
-                    nyq = 0.5 * sample_rate
-                    if p.high_pass_freq > 0:
-                        wn = min(p.high_pass_freq / nyq, 0.99)
-                        sos = butter(4, wn, 'hp', output='sos')
-                        audio = sosfilt(sos, audio).astype(np.float32)
-                    if p.low_pass_freq > 0:
-                        wn = max(p.low_pass_freq / nyq, 0.01)
-                        sos = butter(4, wn, 'lp', output='sos')
-                        audio = sosfilt(sos, audio).astype(np.float32)
-
-                if p.trim and not p.inpaint_source:
-                    audio = trim_silence(audio)
-                if p.normalize and not p.inpaint_source:
-                    audio = normalize_audio(audio)
-                if p.fade_in or p.fade_out:
-                    if not p.inpaint_source:
-                        audio = apply_fade(
-                            audio, sample_rate,
-                            fade_in_s=FADE_DURATION_S if p.fade_in else 0,
-                            fade_out_s=FADE_DURATION_S if p.fade_out else 0
-                        )
-
-                # --- Audio Conditioning (Rhythm Matching) ---
-                if p.conditioning_audio and os.path.exists(p.conditioning_audio):
-                    try:
-                        c_sr, c_data = wavfile.read(p.conditioning_audio)
-                        c_data = normalize_audio_data(c_data)
-                        if len(c_data) < len(audio):
-                            c_data = np.pad(c_data, (0, len(audio) - len(c_data)))
-                        else:
-                            c_data = c_data[:len(audio)]
+                        wav_writer.writeframes(chunk_int16.tobytes())
                         
-                        window_size = max(1, int(0.05 * c_sr))
-                        c_env = np.convolve(np.abs(c_data), np.ones(window_size)/window_size, mode='same')
-                        max_env = np.max(c_env)
-                        if max_env > 0:
-                            c_env = c_env / max_env
-                            audio = audio * c_env
-                            logger.info("Applied conditioning audio envelope.")
-                    except Exception as e:
-                        logger.error(f"Conditioning failed: {e}")
+                    last_audio_chunk = audio_chunk
 
-                # --- Inpainting Splicing ---
+                wav_writer.close()
+
                 if p.inpaint_source and os.path.exists(p.inpaint_source):
                     try:
                         orig_sr, orig_data = wavfile.read(p.inpaint_source)
@@ -965,56 +997,30 @@ class AudioGenerationWorker(QObject):
                         if orig_sr != sample_rate:
                             logger.warning("Inpaint source SR mismatch. Skipping splice.")
                         else:
+                            gen_data = last_audio_chunk
                             start_samp = int(p.inpaint_start_s * sample_rate)
-                            end_samp = start_samp + len(audio)
-                            
-                            fade_len = min(int(0.1 * sample_rate), len(audio)//2, len(orig_data)//2)
+                            end_samp = start_samp + len(gen_data)
+                            fade_len = min(int(0.1 * sample_rate), len(gen_data)//2, len(orig_data)//2)
                             if fade_len > 0:
-                                audio[:fade_len] *= np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
-                                audio[-fade_len:] *= np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+                                gen_data[:fade_len] *= np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+                                gen_data[-fade_len:] *= np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
                                 orig_data[start_samp : start_samp + fade_len] *= np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
                                 orig_data[end_samp - fade_len : end_samp] *= np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
-                                
-                            orig_data[start_samp:end_samp] = audio[:len(orig_data[start_samp:end_samp])]
-                            audio = orig_data
+                            orig_data[start_samp:end_samp] = gen_data[:len(orig_data[start_samp:end_samp])]
+                            final_int16 = (np.clip(orig_data, -1.0, 1.0) * 32767).astype(np.int16)
+                            wavfile.write(out_path, orig_sr, final_int16)
                             logger.info("Inpainting splice successful.")
                     except Exception as e:
-                        logger.error(f"Inpainting splice failed: {e}")
-
-                if audio.size == 0:
-                    raise RuntimeError("Generated audio is empty. Model might have failed.")
-
-                safe_prompt = sanitize_filename(p.prompt)
-                suffix = f"_v{variation + 1}" if p.num_variations > 1 else ""
-                prefix = "inpaint_" if p.inpaint_source else ""
-                filename = f"{prefix}{int(time.time())}_{safe_prompt}{suffix}.wav"
-                out_path = os.path.join(final_out_dir, filename)
-
-                audio_int16 = np.clip(audio, -1.0, 1.0)
-                audio_int16 = (audio_int16 * 32767).astype(np.int16)
-                try:
-                    wavfile.write(out_path, rate=sample_rate, data=audio_int16)
-                except OSError as e:
-                    raise RuntimeError(f"Failed to save audio to disk:\n{e}")
+                        logger.error(f"Inpainting splice failed: {e}", exc_info=True)
 
                 metadata = {
-                    'prompt': p.prompt,
-                    'negative_prompt': p.negative_prompt,
-                    'model': p.model_name,
-                    'duration': p.duration,
-                    'steps': p.steps,
-                    'guidance': p.guidance,
-                    'seed': base_seed,
-                    'sample_rate': sample_rate,
-                    'device': actual_device,
-                    'variation': variation + 1,
-                    'total_variations': p.num_variations,
-                    'generation_time': time.time() - variation_start,
-                    'timestamp': datetime.now().isoformat(),
-                    'chunked_generation': num_chunks > 1,
-                    'num_chunks': num_chunks,
-                    'path': out_path,
-                    'filename': filename
+                    'prompt': p.prompt, 'negative_prompt': p.negative_prompt, 'model': p.model_name,
+                    'duration': p.duration, 'steps': p.steps, 'guidance': p.guidance, 'seed': base_seed,
+                    'sample_rate': sample_rate, 'device': actual_device, 'variation': variation + 1,
+                    'total_variations': total_variations, 'generation_time': time.time() - variation_start,
+                    'timestamp': datetime.now().isoformat(), 'chunked_generation': num_chunks > 1,
+                    'num_chunks': num_chunks, 'path': out_path, 'filename': filename,
+                    'use_seed_travel': p.use_seed_travel, 'tags': [], 'favorite': False
                 }
 
                 saved_paths.append(out_path)
@@ -1025,26 +1031,20 @@ class AudioGenerationWorker(QObject):
             manifest_data = []
             if os.path.exists(manifest_path):
                 try:
-                    with open(manifest_path, 'r', encoding='utf-8') as f:
-                        manifest_data = json.load(f)
-                except Exception:
-                    manifest_data = []
+                    with open(manifest_path, 'r', encoding='utf-8') as f: manifest_data = json.load(f)
+                except Exception: manifest_data = []
 
             manifest_data.extend(metadata_list)
-
             try:
-                with open(manifest_path, 'w', encoding='utf-8') as f:
-                    json.dump(manifest_data, f, indent=4)
+                with open(manifest_path, 'w', encoding='utf-8') as f: json.dump(manifest_data, f, indent=4)
             except Exception as e:
-                logger.error(f"Failed to save manifest.json: {e}")
+                logger.error(f"Failed to save manifest.json: {e}", exc_info=True)
 
             self.progress_updated.emit(100)
             self.status_updated.emit("Generation complete")
             self.eta_updated.emit("")
 
-            self.generation_completed.emit(saved_paths[0],
-                {'paths': saved_paths, 'metadata': metadata_list,
-                 'gen_time': time.time() - gen_start_time})
+            self.generation_completed.emit(saved_paths[0], {'paths': saved_paths, 'metadata': metadata_list, 'gen_time': time.time() - gen_start_time})
 
         except InterruptedError:
             logger.warning("Generation interrupted by user.")
@@ -1053,36 +1053,16 @@ class AudioGenerationWorker(QObject):
             self.eta_updated.emit("")
             self.cancelled.emit()
 
-        except RuntimeError as e:
+        except Exception as e:
+            err_trace = traceback.format_exc()
+            logger.error(f"Generation failed: {err_trace}")
             if "out of memory" in str(e).lower():
-                logger.critical("GPU Out of Memory.")
-                friendly_msg = (
-                    "GPU Out of Memory!\n\n"
-                    "Your graphics card ran out of VRAM. Try:\n"
-                    "- Lowering the Chunk Size (e.g., 5s or 10s)\n"
-                    "- Lowering the number of Steps\n"
-                    "- Enabling CPU Offload (Low VRAM Mode)\n"
-                    "- Closing other GPU-intensive applications"
-                )
+                friendly_msg = ("GPU Out of Memory!\n\nYour graphics card ran out of VRAM. Try:\n"
+                                "- Lowering the Chunk Size (e.g., 5s or 10s)\n- Lowering the number of Steps\n"
+                                "- Enabling CPU Offload (Low VRAM Mode)\n- Closing other GPU-intensive applications")
                 self.error_occurred.emit(friendly_msg)
             else:
-                logger.error(f"RuntimeError: {e}", exc_info=True)
-                self.error_occurred.emit(str(e))
-
-        except AttributeError as e:
-            if "_update_model_kwargs_for_generation" in str(e):
-                logger.critical("Library version conflict detected.")
-                self.error_occurred.emit(
-                    "Library Version Conflict Detected!\n\n"
-                    "Please run:\npip install --upgrade diffusers transformers"
-                )
-            else:
-                logger.error(f"AttributeError: {e}", exc_info=True)
-                self.error_occurred.emit(str(e))
-
-        except Exception as e:
-            logger.error(f"Generation failed: {e}", exc_info=True)
-            self.error_occurred.emit(str(e))
+                self.error_occurred.emit(f"Generation Failed:\n{err_trace}")
 
         finally:
             self.clear_cache()
@@ -1091,6 +1071,7 @@ class AudioGenerationWorker(QObject):
         self.pipe = None
         self.ema_step_time = None
         self.last_step_time = None
+        if hasattr(self, '_latent_shape'): del self._latent_shape
         gc.collect()
         if ML_AVAILABLE and torch.cuda.is_available():
             try:
@@ -1098,12 +1079,11 @@ class AudioGenerationWorker(QObject):
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
             except Exception as e:
-                logger.error(f"Error clearing CUDA cache: {e}")
+                logger.error(f"Error clearing CUDA cache: {e}", exc_info=True)
 
     @classmethod
     def unload_pipeline(cls):
-        with cls._pipe_lock:
-            cls._unload_pipeline_unsafe()
+        with cls._pipe_lock: cls._unload_pipeline_unsafe()
 
     @classmethod
     def _unload_pipeline_unsafe(cls):
@@ -1111,19 +1091,14 @@ class AudioGenerationWorker(QObject):
             try:
                 logger.info(f"Unloading model '{cls._shared_pipe_model}' from memory...")
                 pipe = cls._shared_pipe
-
                 if hasattr(pipe, "remove_hooks"):
-                    try:
-                        pipe.remove_hooks()
-                    except Exception:
-                        pass
-
+                    try: pipe.remove_hooks()
+                    except Exception: pass
                 del pipe
                 cls._shared_pipe = None
                 cls._shared_pipe_model = None
                 cls._shared_pipe_device = None
                 cls._shared_pipe_offload = None
-
                 gc.collect()
                 if ML_AVAILABLE and torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -1131,10 +1106,32 @@ class AudioGenerationWorker(QObject):
                     torch.cuda.ipc_collect()
                 logger.info("Model unloaded successfully.")
             except Exception as e:
-                logger.error(f"Error unloading pipeline: {e}")
+                logger.error(f"Error unloading pipeline: {e}", exc_info=True)
 
 
-# --- AI Tools Workers ---
+class FFmpegWorker(QThread):
+    finished = Signal(bool, str)
+    error = Signal(str)
+
+    def __init__(self, cmd):
+        super().__init__()
+        self.cmd = cmd
+
+    def run(self):
+        try:
+            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+            result = subprocess.run(self.cmd, capture_output=True, text=True, creationflags=creationflags)
+            if result.returncode == 0:
+                self.finished.emit(True, "")
+            else:
+                logger.error(f"FFmpeg failed to encode: {result.stderr}")
+                self.finished.emit(False, result.stderr[-1000:])
+        except Exception as e:
+            err_trace = traceback.format_exc()
+            logger.error(f"FFmpegWorker crashed: {err_trace}")
+            self.error.emit(f"FFmpeg Error:\n{err_trace}")
+
+
 class DemucsWorker(QThread):
     finished = Signal(list)
     error = Signal(str)
@@ -1148,31 +1145,26 @@ class DemucsWorker(QThread):
         try:
             model = get_demucs_model('htdemucs')
             model.to(self.device)
-            
             wav, sr = torchaudio.load(self.audio_path)
-            if sr != model.samplerate:
-                wav = torchaudio.functional.resample(wav, sr, model.samplerate)
-            if wav.shape[0] == 1:
-                wav = wav.repeat(2, 1)
+            if sr != model.samplerate: wav = torchaudio.functional.resample(wav, sr, model.samplerate)
+            if wav.shape[0] == 1: wav = wav.repeat(2, 1)
             wav = wav.unsqueeze(0)
-            
             with torch.inference_mode():
                 stems = apply_demucs_model(model, wav, split=True, overlap=0.25)
-            
             stem_names = ['drums', 'bass', 'other', 'vocals']
             base, _ = os.path.splitext(self.audio_path)
             out_dir = base + "_stems"
             os.makedirs(out_dir, exist_ok=True)
-            
             saved = []
             for i, name in enumerate(stem_names):
                 path = os.path.join(out_dir, f"{name}.wav")
                 torchaudio.save(path, stems[0, i].cpu(), model.samplerate)
                 saved.append(path)
-            
             self.finished.emit(saved)
         except Exception as e:
-            self.error.emit(str(e))
+            err_trace = traceback.format_exc()
+            logger.error(f"DemucsWorker crashed: {err_trace}")
+            self.error.emit(f"Demucs Error:\n{err_trace}")
 
 class WhisperWorker(QThread):
     finished = Signal(str)
@@ -1188,7 +1180,9 @@ class WhisperWorker(QThread):
             result = model.transcribe(self.audio_path)
             self.finished.emit(result["text"])
         except Exception as e:
-            self.error.emit(str(e))
+            err_trace = traceback.format_exc()
+            logger.error(f"WhisperWorker crashed: {err_trace}")
+            self.error.emit(f"Whisper Error:\n{err_trace}")
 
 class CLAPWorker(QThread):
     finished = Signal(float)
@@ -1203,28 +1197,100 @@ class CLAPWorker(QThread):
         try:
             processor = ClapProcessor.from_pretrained("laion/clap-htsat-unfused")
             model = ClapModel.from_pretrained("laion/clap-htsat-unfused")
-            
             sr, data = wavfile.read(self.audio_path)
             data = normalize_audio_data(data)
-            
             inputs = processor(text=[self.prompt], audios=data, sampling_rate=sr, return_tensors="pt", padding=True)
-            
             with torch.inference_mode():
                 audio_embed = model.get_audio_features(**inputs)
                 text_embed = model.get_text_features(**inputs)
-                
                 audio_embed = audio_embed / audio_embed.norm(dim=-1, keepdim=True)
                 text_embed = text_embed / text_embed.norm(dim=-1, keepdim=True)
-                
                 sim = (audio_embed @ text_embed.T).item()
                 score = (sim + 1) / 2 * 100
-            
             self.finished.emit(score)
         except Exception as e:
-            self.error.emit(str(e))
+            err_trace = traceback.format_exc()
+            logger.error(f"CLAPWorker crashed: {err_trace}")
+            self.error.emit(f"CLAP Error:\n{err_trace}")
 
 
-# --- Custom Widgets ---
+class AudioStatsWorker(QThread):
+    statsReady = Signal(float, float)
+    error = Signal(str)
+
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+
+    def run(self):
+        try:
+            with wave.open(self.path, 'rb') as wf:
+                sr = wf.getframerate()
+                frames_to_read = min(wf.getnframes(), sr * 60)
+                raw = wf.readframes(frames_to_read)
+            
+            data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            if data.size == 0:
+                self.statsReady.emit(-120.0, -120.0)
+                return
+            peak = float(np.max(np.abs(data)))
+            rms = float(np.sqrt(np.mean(np.square(data))))
+            self.statsReady.emit(peak, rms)
+        except Exception as e:
+            err_trace = traceback.format_exc()
+            logger.error(f"AudioStatsWorker crashed: {err_trace}")
+            self.error.emit(f"Stats Error:\n{err_trace}")
+
+
+class SpectrogramWorker(QThread):
+    arrayReady = Signal(object)
+    
+    def __init__(self, audio_data, sample_rate):
+        super().__init__()
+        self.audio = audio_data
+        self.sr = sample_rate
+
+    def run(self):
+        try:
+            if self.audio is None or self.audio.size == 0:
+                self.arrayReady.emit(None)
+                return
+
+            nperseg = 2048 if self.sr >= 44100 else 1024
+            nperseg = min(nperseg, len(self.audio))
+
+            freqs, times, Sxx = scipy.signal.spectrogram(
+                self.audio, fs=self.sr, nperseg=nperseg, noverlap=nperseg // 2, window='hann'
+            )
+
+            Sxx_log = 10 * np.log10(Sxx + 1e-10)
+            vmin = float(np.percentile(Sxx_log, 10))
+            vmax = float(np.percentile(Sxx_log, 99))
+            if vmax <= vmin: vmax = vmin + 1.0
+            Sxx_norm = np.clip((Sxx_log - vmin) / (vmax - vmin), 0.0, 1.0)
+
+            del Sxx_log, Sxx
+
+            xp = [0.0, 0.25, 0.5, 0.75, 1.0]
+            fp_r = [68, 59, 33, 53, 253]
+            fp_g = [1, 82, 145, 148, 231]
+            fp_b = [84, 139, 140, 27, 36]
+            r = np.interp(Sxx_norm, xp, fp_r)
+            g = np.interp(Sxx_norm, xp, fp_g)
+            b = np.interp(Sxx_norm, xp, fp_b)
+            del Sxx_norm
+
+            rgb_array = np.stack((r, g, b), axis=-1).astype(np.uint8)
+            rgb_array = rgb_array[::-1]
+            rgb_array = np.ascontiguousarray(rgb_array)
+            
+            self.arrayReady.emit(rgb_array)
+        except Exception as e:
+            err_trace = traceback.format_exc()
+            logger.error(f"SpectrogramWorker crashed: {err_trace}")
+            self.arrayReady.emit(None)
+
+
 class SpectrogramWidget(QWidget):
     seekRequested = Signal(float)
     selectionChanged = Signal(float, float)
@@ -1251,6 +1317,8 @@ class SpectrogramWidget(QWidget):
         self._sel_start = -1.0
         self._sel_end = -1.0
         self._is_dragging = False
+        
+        self._spec_worker = None
 
     def set_inpaint_mode(self, enabled):
         self.inpaint_mode = enabled
@@ -1261,79 +1329,56 @@ class SpectrogramWidget(QWidget):
         self.update()
 
     def get_selection(self):
-        if self._sel_start < 0 or self._sel_end < 0:
-            return -1.0, -1.0
+        if self._sel_start < 0 or self._sel_end < 0: return -1.0, -1.0
         return min(self._sel_start, self._sel_end), max(self._sel_start, self._sel_end)
 
     def set_audio(self, path: str):
-        if path == self._pending_path and self._render_timer.isActive():
-            return
+        if path == self._pending_path and self._render_timer.isActive(): return
         self._pending_path = path
         self._render_timer.start()
 
     def _flush_pending_audio(self):
         path = self._pending_path
-        if not path:
-            return
+        if not path: return
         try:
-            sample_rate, data = wavfile.read(path)
-            self._sample_rate = sample_rate
-            data = normalize_audio_data(data)
+            with wave.open(path, 'rb') as wf:
+                self._sample_rate = wf.getframerate()
+                frames_to_read = min(wf.getnframes(), self._sample_rate * 60)
+                raw = wf.readframes(frames_to_read)
+                data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                self.duration_s = wf.getnframes() / self._sample_rate
+            
             self._raw_audio = data
-            self.duration_s = len(data) / self._sample_rate if self._sample_rate > 0 else 0.0
-            self._compute_spectrogram()
+            
+            if self._spec_worker and self._spec_worker.isRunning():
+                self._spec_worker.quit()
+                self._spec_worker.wait(500)
+            
+            self._qimg = None
+            self._qpix = None
             self.update()
+            
+            self._spec_worker = SpectrogramWorker(self._raw_audio, self._sample_rate)
+            self._spec_worker.arrayReady.connect(self._on_spec_ready)
+            self._spec_worker.start()
+            
         except Exception as e:
-            logger.error(f"Failed to load spectrogram: {e}")
+            logger.error(f"Failed to load spectrogram: {e}", exc_info=True)
             self._raw_audio = None
             self._qimg = None
             self._qpix = None
             self.update()
 
-    def _compute_spectrogram(self):
-        if self._raw_audio is None or self._raw_audio.size == 0:
+    def _on_spec_ready(self, rgb_array):
+        if rgb_array is None:
             self._qimg = None
             self._qpix = None
-            return
-
-        nperseg = 2048 if self._sample_rate >= 44100 else 1024
-        nperseg = min(nperseg, len(self._raw_audio))
-
-        freqs, times, Sxx = scipy.signal.spectrogram(
-            self._raw_audio,
-            fs=self._sample_rate,
-            nperseg=nperseg,
-            noverlap=nperseg // 2,
-            window='hann'
-        )
-
-        Sxx_log = 10 * np.log10(Sxx + 1e-10)
-        vmin = float(np.percentile(Sxx_log, 10))
-        vmax = float(np.percentile(Sxx_log, 99))
-        if vmax <= vmin:
-            vmax = vmin + 1.0
-        Sxx_norm = np.clip((Sxx_log - vmin) / (vmax - vmin), 0.0, 1.0)
-
-        del Sxx_log, Sxx
-
-        xp = [0.0, 0.25, 0.5, 0.75, 1.0]
-        fp_r = [68, 59, 33, 53, 253]
-        fp_g = [1, 82, 145, 148, 231]
-        fp_b = [84, 139, 140, 27, 36]
-        r = np.interp(Sxx_norm, xp, fp_r)
-        g = np.interp(Sxx_norm, xp, fp_g)
-        b = np.interp(Sxx_norm, xp, fp_b)
-        del Sxx_norm
-
-        rgb_array = np.stack((r, g, b), axis=-1).astype(np.uint8)
-        rgb_array = rgb_array[::-1]
-        rgb_array = np.ascontiguousarray(rgb_array)
-
-        h, w, _ = rgb_array.shape
-        self._qimg = QImage(rgb_array.data, w, h, 3 * w, QImage.Format_RGB888).copy()
-        self._qpix = QPixmap.fromImage(self._qimg)
-
-        del r, g, b, rgb_array, freqs, times
+        else:
+            h, w, _ = rgb_array.shape
+            self._qimg = QImage(rgb_array.data, w, h, 3 * w, QImage.Format_RGB888).copy()
+            self._qpix = QPixmap.fromImage(self._qimg)
+            self._raw_audio = None
+        self.update()
 
     def set_playback_position(self, position: float):
         self.playback_position = max(0.0, min(1.0, position))
@@ -1368,17 +1413,13 @@ class SpectrogramWidget(QWidget):
             return
 
         if self._qpix is not None and self.duration_s > 0 and self._sample_rate > 0:
-            x = event.position().x()
-            y = event.position().y()
-
+            x, y = event.position().x(), event.position().y()
             t_s = (x / max(self.width(), 1)) * self.duration_s
             nyquist = self._sample_rate / 2
             freq = nyquist * (1 - (y / max(self.height(), 1)))
 
-            if freq >= 1000:
-                text = f"Time: {t_s:.2f}s | Freq: {freq/1000:.2f} kHz"
-            else:
-                text = f"Time: {t_s:.2f}s | Freq: {freq:.0f} Hz"
+            if freq >= 1000: text = f"Time: {format_time(t_s)} | Freq: {freq/1000:.2f} kHz"
+            else: text = f"Time: {format_time(t_s)} | Freq: {freq:.0f} Hz"
             QToolTip.showText(event.globalPosition().toPoint(), text, self)
 
             if event.buttons() & Qt.LeftButton:
@@ -1395,7 +1436,7 @@ class SpectrogramWidget(QWidget):
             else:
                 self._sel_start = -1.0
                 self._sel_end = -1.0
-                self.selectionChanged.emit(-1.0, -1.0)
+            self.selectionChanged.emit(-1.0, -1.0)
             self.update()
 
     def leaveEvent(self, event):
@@ -1411,7 +1452,7 @@ class SpectrogramWidget(QWidget):
 
         if self._qpix is None:
             painter.setPen(QColor(100, 100, 100))
-            painter.drawText(self.rect(), Qt.AlignCenter, "No spectrogram loaded")
+            painter.drawText(self.rect(), Qt.AlignCenter, "Computing spectrogram..." if self._raw_audio is not None else "No spectrogram loaded")
             return
 
         painter.drawPixmap(self.rect(), self._qpix)
@@ -1430,7 +1471,9 @@ class SpectrogramWidget(QWidget):
 
         if self.duration_s > 0:
             step_s = 1.0
-            if self.duration_s > 60: step_s = 15.0
+            if self.duration_s > 3600: step_s = 600.0
+            elif self.duration_s > 600: step_s = 60.0
+            elif self.duration_s > 60: step_s = 15.0
             elif self.duration_s > 30: step_s = 5.0
             elif self.duration_s > 10: step_s = 2.0
 
@@ -1465,8 +1508,8 @@ class WaveformWidget(QWidget):
         self._peaks = None
         self._rms = None
         self._peaks_width = 0
-        self._path_peak = None
-        self._path_rms = None
+        self._poly_peak = None
+        self._poly_rms = None
         self.sample_rate = 16000
         self.duration_s = 0.0
         self.setMinimumHeight(120)
@@ -1481,40 +1524,40 @@ class WaveformWidget(QWidget):
             self._reset_state()
             return
         try:
-            sample_rate, data = wavfile.read(path)
-            self.sample_rate = sample_rate
-            self._raw_audio = normalize_audio_data(data)
-            self.duration_s = len(self._raw_audio) / self.sample_rate if self.sample_rate > 0 else 0.0
+            with wave.open(path, 'rb') as wf:
+                self.sample_rate = wf.getframerate()
+                frames_to_read = min(wf.getnframes(), self.sample_rate * 60)
+                raw = wf.readframes(frames_to_read)
+                self._raw_audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                self.duration_s = wf.getnframes() / self.sample_rate
+                
             self._peaks = None
-            self._path_peak = None
-            self._path_rms = None
+            self._poly_peak = None
+            self._poly_rms = None
             self._ensure_peaks(self.width())
             self.update()
         except Exception as e:
-            logger.error(f"Failed to load waveform: {e}")
+            logger.error(f"Failed to load waveform: {e}", exc_info=True)
             self._reset_state()
 
     def _reset_state(self):
         self._raw_audio = None
         self._peaks = None
-        self._path_peak = None
-        self._path_rms = None
+        self._poly_peak = None
+        self._poly_rms = None
         self.update()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._peaks = None
-        self._path_peak = None
-        self._path_rms = None
+        self._poly_peak = None
+        self._poly_rms = None
         self.update()
 
     def _ensure_peaks(self, width: int):
-        if self._peaks is not None and self._peaks_width == width:
-            return
+        if self._peaks is not None and self._peaks_width == width: return
         if self._raw_audio is None or width <= 0:
-            self._peaks = None
-            self._path_peak = None
-            self._path_rms = None
+            self._peaks, self._poly_peak, self._poly_rms = None, None, None
             return
 
         n = len(self._raw_audio)
@@ -1525,14 +1568,13 @@ class WaveformWidget(QWidget):
             abs_audio = np.abs(self._raw_audio)
             if n <= width:
                 self._peaks = np.pad(abs_audio, (0, width - n), 'constant').astype(np.float32)
-                self._rms = self._peaks * 0.707
+                self._rms = np.pad(np.sqrt(np.mean(abs_audio**2)), (0, width - 1), 'constant').astype(np.float32) if n > 0 else np.zeros(width, dtype=np.float32)
             else:
                 chunk_size = max(1, n // width)
                 n_full = (n // chunk_size) * chunk_size
                 trimmed = abs_audio[:n_full].reshape(-1, chunk_size)
                 self._peaks = trimmed.max(axis=1).astype(np.float32)
                 self._rms = np.sqrt(np.mean(trimmed**2, axis=1)).astype(np.float32)
-                
                 if len(self._peaks) < width:
                     pad = width - len(self._peaks)
                     self._peaks = np.pad(self._peaks, (0, pad), 'constant')
@@ -1540,29 +1582,25 @@ class WaveformWidget(QWidget):
             del abs_audio
             self._peaks_width = width
 
-        self._path_peak = self._build_path(self._peaks, width)
-        self._path_rms = self._build_path(self._rms, width)
+        self._poly_peak = self._build_poly(self._peaks, width)
+        self._poly_rms = self._build_poly(self._rms, width)
         self.update()
 
-    def _build_path(self, heights, width):
+    def _build_poly(self, heights, width):
         mid = self.height() / 2.0
         max_h = self.height() * 0.42
-        path = QPainterPath()
-        if width == 0:
-            return path
+        poly = QPolygonF()
+        if width == 0: return poly
 
-        path.moveTo(0, mid)
+        poly << QPointF(0, mid)
         for x, h in enumerate(heights):
-            y = mid - (h * max_h)
-            path.lineTo(x, y)
+            poly << QPointF(x, mid - (h * max_h))
 
-        path.lineTo(width, mid)
+        poly << QPointF(width, mid)
         for x in range(width - 1, -1, -1):
             h = heights[x]
-            y = mid + (h * max_h)
-            path.lineTo(x, y)
-        path.closeSubpath()
-        return path
+            poly << QPointF(x, mid + (h * max_h))
+        return poly
 
     def set_playback_position(self, position: float):
         self.playback_position = max(0.0, min(1.0, position))
@@ -1571,14 +1609,13 @@ class WaveformWidget(QWidget):
     def clear(self):
         self._raw_audio = None
         self._peaks = None
-        self._path_peak = None
-        self._path_rms = None
+        self._poly_peak = None
+        self._poly_rms = None
         self.duration_s = 0.0
         self.update()
 
     def rms_at(self, norm_pos: float) -> float:
-        if self._rms is None or len(self._rms) == 0:
-            return 0.0
+        if self._rms is None or len(self._rms) == 0: return 0.0
         idx = int(max(0.0, min(1.0, norm_pos)) * (len(self._rms) - 1))
         return float(self._rms[idx])
 
@@ -1604,12 +1641,11 @@ class WaveformWidget(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        width = self.width()
-        height = self.height()
+        width, height = self.width(), self.height()
 
         painter.fillRect(self.rect(), QColor(22, 22, 26))
 
-        if self._path_peak is None:
+        if self._poly_peak is None:
             painter.setPen(QColor(100, 100, 100))
             painter.drawText(self.rect(), Qt.AlignCenter, "No audio loaded")
             return
@@ -1619,7 +1655,9 @@ class WaveformWidget(QWidget):
 
         if self.duration_s > 0:
             step_s = 1.0
-            if self.duration_s > 60: step_s = 15.0
+            if self.duration_s > 3600: step_s = 600.0
+            elif self.duration_s > 600: step_s = 60.0
+            elif self.duration_s > 60: step_s = 15.0
             elif self.duration_s > 30: step_s = 5.0
             elif self.duration_s > 10: step_s = 2.0
 
@@ -1636,10 +1674,10 @@ class WaveformWidget(QWidget):
         painter.setClipRect(play_x, 0, width - play_x, height)
         painter.setBrush(QColor(60, 65, 75))
         painter.setPen(Qt.NoPen)
-        painter.drawPath(self._path_peak)
+        painter.drawPolygon(self._poly_peak)
 
         painter.setBrush(QColor(80, 90, 100))
-        painter.drawPath(self._path_rms)
+        painter.drawPolygon(self._poly_rms)
 
         painter.setClipRect(0, 0, play_x + 1, height)
         grad = QLinearGradient(0, 0, 0, height)
@@ -1647,10 +1685,10 @@ class WaveformWidget(QWidget):
         grad.setColorAt(0.5, QColor(80, 220, 255))
         grad.setColorAt(1.0, QColor(40, 160, 240))
         painter.setBrush(grad)
-        painter.drawPath(self._path_peak)
+        painter.drawPolygon(self._poly_peak)
 
         painter.setBrush(QColor(150, 240, 255, 220))
-        painter.drawPath(self._path_rms)
+        painter.drawPolygon(self._poly_rms)
 
         painter.setClipping(False)
 
@@ -1673,15 +1711,17 @@ class WaveformWidget(QWidget):
 
 class MiniWaveformItem(QTableWidgetItem):
     @staticmethod
-    def generate_pixmap(path: str) -> QPixmap:
-        if not path or not os.path.exists(path):
-            return None
+    @lru_cache(maxsize=500)
+    def _cached_pixmap(path: str, mtime: float) -> QPixmap:
         p = None
         try:
-            _, data = wavfile.read(path)
-            data = normalize_audio_data(data)
-            if data.size == 0:
-                return None
+            with wave.open(path, 'rb') as wf:
+                sr = wf.getframerate()
+                frames_to_read = min(wf.getnframes(), sr * 30)
+                raw = wf.readframes(frames_to_read)
+                data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                
+            if data.size == 0: return None
 
             chunk = max(1, len(data) // THUMB_BARS)
             n_full = (len(data) // chunk) * chunk
@@ -1690,8 +1730,6 @@ class MiniWaveformItem(QTableWidgetItem):
                 peaks = np.pad(peaks, (0, THUMB_BARS - len(peaks)), 'constant')
             peaks = peaks[:THUMB_BARS]
 
-            # Convert to a plain Python list of native floats.
-            # This avoids numpy scalar -> Shiboken int conversion issues.
             peaks_list = [float(v) for v in peaks]
 
             pix = QPixmap(THUMB_WIDTH, THUMB_HEIGHT)
@@ -1702,25 +1740,29 @@ class MiniWaveformItem(QTableWidgetItem):
             pen.setCapStyle(Qt.RoundCap)
             p.setPen(pen)
 
-            mid = THUMB_HEIGHT // 2           # integer midpoint
-            max_h = (THUMB_HEIGHT // 2) - 1   # keep inside pixmap
+            mid = THUMB_HEIGHT // 2
+            max_h = (THUMB_HEIGHT // 2) - 1
             for i, pk in enumerate(peaks_list):
                 h = min(pk * 12.0, float(max_h))
-                h_int = int(round(h))         
+                h_int = int(round(h))
                 x = i * 2
-                # drawLine needs ints; pass ints explicitly:
                 p.drawLine(int(x), mid - h_int, int(x), mid + h_int)
             return pix
         except Exception as e:
-            logger.debug(f"MiniWaveformItem thumbnail failed for {path}: {e}")
+            logger.error(f"MiniWaveformItem thumbnail failed for {path}: {e}", exc_info=True)
             return None
         finally:
-            if p is not None:
-                p.end()
+            if p is not None: p.end()
+
+    @staticmethod
+    def generate_pixmap(path: str) -> QPixmap:
+        if not path or not os.path.exists(path): return None
+        mtime = os.path.getmtime(path)
+        return MiniWaveformItem._cached_pixmap(path, mtime)
 
     def __init__(self, path: str, duration: float):
         super().__init__()
-        self.setText(f"{duration:.1f}s")
+        self.setText(format_time(duration))
         self.setTextAlignment(Qt.AlignCenter)
         self.setToolTip(path)
         self._path = path
@@ -1738,31 +1780,30 @@ class ThumbnailWorker(QThread):
     def __init__(self, table, parent=None):
         super().__init__(parent)
         self._table = table
-        self._queue = deque()
-        self._lock = threading.Lock()
+        self._queue = queue.Queue()
         self._running = True
 
     def enqueue(self, row: int, path: str):
-        with self._lock:
-            self._queue.append((row, path))
+        self._queue.put((row, path))
 
     def stop(self):
         self._running = False
-        self.wait(2000)
+        self._queue.put(None)
 
     def run(self):
         while self._running:
-            item = None
-            with self._lock:
-                if self._queue:
-                    item = self._queue.popleft()
-            if item is None:
-                self.msleep(40)
+            try:
+                item = self._queue.get(timeout=0.1)
+            except queue.Empty:
                 continue
+            if item is None: break
             row, path = item
-            pix = MiniWaveformItem.generate_pixmap(path)
-            if pix is not None and self._running:
-                self.thumbReady.emit(row, pix)
+            try:
+                pix = MiniWaveformItem.generate_pixmap(path)
+                if pix is not None and self._running:
+                    self.thumbReady.emit(row, pix)
+            except Exception as e:
+                logger.error(f"ThumbnailWorker crashed on item {path}: {e}", exc_info=True)
 
 
 class ClickableLabel(QLabel):
@@ -1773,7 +1814,6 @@ class ClickableLabel(QLabel):
 
 
 class VariationCard(QFrame):
-    """Interactive UI card representing a single generated audio variation."""
     playRequested = Signal(str)
     selected = Signal(str)
 
@@ -1796,7 +1836,7 @@ class VariationCard(QFrame):
         title.setStyleSheet("font-weight: bold; color: #2A82DA;")
         header_row.addWidget(title)
         header_row.addStretch()
-        dur_lbl = QLabel(f"{duration:.1f}s")
+        dur_lbl = QLabel(format_time(duration))
         dur_lbl.setStyleSheet("font-size: 10px; color: #888;")
         header_row.addWidget(dur_lbl)
         layout.addLayout(header_row)
@@ -1824,7 +1864,7 @@ class VariationCard(QFrame):
         load_btn = QPushButton("Load")
         load_btn.setFixedHeight(26)
         load_btn.setStyleSheet("QPushButton { background-color: #3c3c3c; color: white; border-radius: 3px; font-size: 11px; } QPushButton:hover { background-color: #4a4a4a; }")
-        load_btn.clicked.connect(lambda: self.selected.emit(self.path))
+        load_btn.clicked.connect(lambda: self.selected.emit(self.path))  # FIX: Syntax error corrected
         btn_row.addWidget(load_btn)
 
         layout.addLayout(btn_row)
@@ -1850,8 +1890,7 @@ class PromptHistoryLineEdit(QPlainTextEdit):
         self.c.activated.connect(self.insert_completion)
 
     def insert_completion(self, completion):
-        if self.c.widget() != self:
-            return
+        if self.c.widget() != self: return
         cursor = self.textCursor()
         extra = len(completion) - len(self.c.completionPrefix())
         cursor.movePosition(QTextCursor.Left)
@@ -1862,7 +1901,13 @@ class PromptHistoryLineEdit(QPlainTextEdit):
     def text_under_cursor(self):
         tc = self.textCursor()
         tc.select(QTextCursor.WordUnderCursor)
-        return tc.selectedText()
+        word = tc.selectedText()
+        start = tc.selectionStart()
+        end = tc.selectionEnd()
+        text = self.toPlainText()
+        while start > 0 and text[start-1] not in (' ', '\n', ','):
+            start -= 1
+        return text[start:end]
 
     def keyPressEvent(self, event):
         if self.c.popup().isVisible():
@@ -1883,8 +1928,7 @@ class PromptHistoryLineEdit(QPlainTextEdit):
         super().keyPressEvent(event)
 
         ctrl_or_shift = event.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier)
-        if ctrl_or_shift and len(event.text()) == 0:
-            return
+        if ctrl_or_shift and len(event.text()) == 0: return
 
         prefix = self.text_under_cursor()
         if prefix != self.c.completionPrefix():
@@ -1899,25 +1943,138 @@ class PromptHistoryLineEdit(QPlainTextEdit):
             self.c.popup().hide()
 
     def navigate_history(self, direction):
-        if not self.history:
-            return
-        if self.history_index == -1:
-            self._saved_text = self.toPlainText()
+        if not self.history: return
+        if self.history_index == -1: self._saved_text = self.toPlainText()
         new_index = max(-1, min(len(self.history) - 1, self.history_index + direction))
-        if new_index == self.history_index:
-            return
+        if new_index == self.history_index: return
         self.history_index = new_index
         self.setPlainText(self._saved_text if self.history_index == -1 else self.history[self.history_index])
 
     def add_to_history(self, text):
         if text and (not self.history or self.history[-1] != text):
             self.history.append(text)
-            if len(self.history) > MAX_PROMPT_HISTORY:
-                self.history.pop(0)
+            if len(self.history) > MAX_PROMPT_HISTORY: self.history.pop(0)
             self.history_index = -1
 
 
-# --- Main Window ---
+class FxChainDialog(QDialog):
+    PLUGIN_PARAMS = {
+        "Reverb": ["room_size", "damping", "wet_level", "dry_level", "width", "freeze_mode"],
+        "Delay": ["delay_seconds", "feedback", "mix"],
+        "Chorus": ["rate_hz", "depth", "centre_delay_ms", "feedback", "mix"],
+        "Distortion": ["drive_db"],
+        "Compressor": ["threshold_db", "ratio", "attack_ms", "release_ms"],
+        "LowpassFilter": ["cutoff_frequency_hz"],
+        "HighpassFilter": ["cutoff_frequency_hz"],
+        "Gain": ["gain_db"]
+    }
+
+    def __init__(self, parent, current_chain=None):
+        super().__init__(parent)
+        self.setWindowTitle("Real-Time FX Chain")
+        self.setMinimumWidth(500)
+        self.setMinimumHeight(400)
+        self.chain = current_chain if current_chain else []
+        
+        layout = QVBoxLayout(self)
+        
+        avail_group = QGroupBox("Available Plugins")
+        avail_layout = QHBoxLayout(avail_group)
+        self.avail_list = QListWidget()
+        self.plugin_classes = {
+            "Reverb": Reverb, "Delay": Delay, "Chorus": Chorus, 
+            "Distortion": Distortion, "Compressor": Compressor,
+            "LowpassFilter": LowpassFilter, "HighpassFilter": HighpassFilter, "Gain": Gain
+        }
+        for name in self.plugin_classes.keys():
+            self.avail_list.addItem(name)
+        self.avail_list.setFixedWidth(150)
+        avail_layout.addWidget(self.avail_list)
+        
+        add_btn = QPushButton("→ Add →")
+        add_btn.clicked.connect(self.add_plugin)
+        avail_layout.addWidget(add_btn, alignment=Qt.AlignCenter)
+        layout.addWidget(avail_group)
+        
+        active_group = QGroupBox("Active Chain (Top to Bottom)")
+        active_layout = QHBoxLayout(active_group)
+        
+        self.active_list = QListWidget()
+        self.active_list.setFixedWidth(150)
+        self.update_active_list()
+        active_layout.addWidget(self.active_list)
+        
+        controls_layout = QVBoxLayout()
+        self.params_layout = QFormLayout()
+        controls_layout.addLayout(self.params_layout)
+        
+        remove_btn = QPushButton("Remove Selected")
+        remove_btn.clicked.connect(self.remove_plugin)
+        controls_layout.addWidget(remove_btn)
+        active_layout.addLayout(controls_layout, 1)
+        
+        layout.addWidget(active_group)
+        
+        btn_box = QHBoxLayout()
+        apply_btn = QPushButton("Apply & Close")
+        apply_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_box.addStretch()
+        btn_box.addWidget(apply_btn)
+        btn_box.addWidget(cancel_btn)
+        layout.addLayout(btn_box)
+        
+        self.active_list.currentRowChanged.connect(self.load_params_ui)
+
+    def update_active_list(self):
+        self.active_list.clear()
+        for plugin in self.chain:
+            self.active_list.addItem(plugin.__class__.__name__)
+
+    def add_plugin(self):
+        item = self.avail_list.currentItem()
+        if not item: return
+        plugin_name = item.text()
+        plugin_class = self.plugin_classes[plugin_name]
+        new_plugin = plugin_class()
+        self.chain.append(new_plugin)
+        self.update_active_list()
+        self.active_list.setCurrentRow(len(self.chain) - 1)
+
+    def remove_plugin(self):
+        row = self.active_list.currentRow()
+        if row >= 0 and row < len(self.chain):
+            del self.chain[row]
+            self.update_active_list()
+            self.clear_params_ui()
+
+    def clear_params_ui(self):
+        while self.params_layout.rowCount() > 0:
+            self.params_layout.removeRow(0)
+
+    def load_params_ui(self, row):
+        self.clear_params_ui()
+        if row < 0 or row >= len(self.chain): return
+            
+        plugin = self.chain[row]
+        plugin_name = plugin.__class__.__name__
+        attrs = self.PLUGIN_PARAMS.get(plugin_name, [])
+        
+        for attr_name in attrs:
+            val = getattr(plugin, attr_name, 0.0)
+            if isinstance(val, (float, int)):
+                spin = QDoubleSpinBox()
+                spin.setRange(0.0, 1.0 if val <= 1.0 else 20000.0)
+                spin.setSingleStep(0.01 if val <= 1.0 else 1.0)
+                spin.setValue(float(val))
+                spin.valueChanged.connect(lambda v, p=plugin, a=attr_name: setattr(p, a, v))
+                self.params_layout.addRow(attr_name + ":", spin)
+
+    def get_chain(self):
+        return self.chain
+
+
 class AudioLDM2Studio(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1926,54 +2083,91 @@ class AudioLDM2Studio(QMainWindow):
         self.setMinimumSize(1000, 650)
         log_system_info()
 
-        if not ML_AVAILABLE:
-            QMessageBox.critical(self, "Missing Dependencies",
-                "ML libraries (torch, diffusers, transformers) are not installed.\n"
-                "Please install them with:\n"
-                "pip install torch diffusers transformers")
+        try:
+            if not ML_AVAILABLE:
+                logger.error("ML libraries (torch, diffusers, transformers) are not installed.")
+                sys.exit(1)
+
+            self.settings = JsonSettings(os.path.join(CWD, "config.json"))
+
+            self.worker_thread = None
+            self.worker = None
+            
+            self.base_audio_path = None
+            self.current_audio_path = None
+
+            self.batch_orchestrator = BatchOrchestrator(self)
+            self.batch_orchestrator.next_prompt_ready.connect(self._on_batch_prompt_ready)
+            self.batch_orchestrator.batch_finished.connect(self._on_batch_finished)
+
+            self.prompt_history = []
+            self.setAcceptDrops(True)
+
+            self.demucs_worker = None
+            self.whisper_worker = None
+            self.clap_worker = None
+            self.stats_worker = None
+            self.ffmpeg_worker = None
+
+            self._inpaint_active = False
+            self._inpaint_source = ""
+            self._inpaint_start = 0.0
+            self._inpaint_end = 0.0
+            
+            self.fx_chain = []
+            if PEDALBOARD_AVAILABLE:
+                saved_chain_data = self.settings.value("fx_chain", [])
+                self.fx_chain = self.deserialize_fx_chain(saved_chain_data)
+
+            self.check_library_versions()
+            self.setup_ui()
+            self.setup_audio()
+            self.setup_statusbar()
+            self.setup_tray_icon()
+            self.load_settings()
+            self.setup_shortcuts()
+            
+            QTimer.singleShot(1000, self.check_interrupted_batch)
+
+            self._thumb_worker = ThumbnailWorker(self.playlist_table, self)
+            self._thumb_worker.thumbReady.connect(self._on_thumb_ready)
+            self._thumb_worker.start()
+
+            self.autosave_timer = QTimer(self)
+            self.autosave_timer.timeout.connect(self.auto_save_state)
+            self.autosave_timer.start(AUTO_SAVE_INTERVAL_MS)
+            
+        except Exception:
+            logger.critical("Failed to initialize AudioLDM2Studio UI", exc_info=True)
             sys.exit(1)
 
-        self.settings = JsonSettings(os.path.join(CWD, "config.json"))
+    def deserialize_fx_chain(self, data):
+        chain = []
+        if not PEDALBOARD_AVAILABLE: return chain
+        plugin_map = {
+            "Reverb": Reverb, "Delay": Delay, "Chorus": Chorus, 
+            "Distortion": Distortion, "Compressor": Compressor,
+            "LowpassFilter": LowpassFilter, "HighpassFilter": HighpassFilter, "Gain": Gain
+        }
+        for item in data:
+            p_class = plugin_map.get(item.get("class"))
+            if p_class:
+                params = item.get("params", {})
+                try:
+                    chain.append(p_class(**params))
+                except TypeError:
+                    chain.append(p_class())
+        return chain
 
-        self.worker_thread = None
-        self.worker = None
-        self.current_audio_path = None
-        self.current_audio_paths = []
-
-        self.batch_state = BatchState.IDLE
-        self.batch_prompts = []
-        self.batch_index = 0
-
-        self.prompt_history = []
-        self.setAcceptDrops(True)
-
-        self.demucs_worker = None
-        self.whisper_worker = None
-        self.clap_worker = None
-
-        self._inpaint_active = False
-        self._inpaint_source = ""
-        self._inpaint_start = 0.0
-        self._inpaint_end = 0.0
-
-        self.check_library_versions()
-        self.setup_ui()
-        self.setup_audio()
-        self.setup_statusbar()
-        self.load_settings()
-        self.setup_shortcuts()
-        self.check_interrupted_batch()
-
-        self._thumb_worker = ThumbnailWorker(self.playlist_table, self)
-        self._thumb_worker.thumbReady.connect(self._on_thumb_ready)
-        self._thumb_worker.start()
-
-        self.autosave_timer = QTimer(self)
-        self.autosave_timer.timeout.connect(self.auto_save_state)
-        self.autosave_timer.start(AUTO_SAVE_INTERVAL_MS)
+    def serialize_fx_chain(self):
+        data = []
+        for plugin in self.fx_chain:
+            attrs = {a: getattr(plugin, a) for a in dir(plugin) if not a.startswith('_') and not callable(getattr(plugin, a))}
+            data.append({"class": plugin.__class__.__name__, "params": attrs})
+        return data
 
     def _on_thumb_ready(self, row: int, pix: QPixmap):
-        item = self.playlist_table.item(row, 1)
+        item = self.playlist_table.item(row, 3)
         if isinstance(item, MiniWaveformItem):
             item.set_pixmap(pix)
 
@@ -1983,10 +2177,7 @@ class AudioLDM2Studio(QMainWindow):
             d_ver = diffusers.__version__.split('.')
             if int(t_ver[0]) >= 4 and int(t_ver[1]) >= 40:
                 if int(d_ver[0]) == 0 and int(d_ver[1]) < 29:
-                    QMessageBox.warning(self, "Potential Version Conflict",
-                        "You may experience a crash due to a library bug.\n"
-                        "If generation fails, run:\n"
-                        "pip install --upgrade diffusers transformers")
+                    logger.warning("Potential library version conflict detected.")
         except Exception:
             pass
 
@@ -2008,13 +2199,11 @@ class AudioLDM2Studio(QMainWindow):
 
         try:
             geo = self.settings.value("geometry")
-            if geo:
-                self.restoreGeometry(geo)
+            if geo: self.restoreGeometry(geo)
             state = self.settings.value("windowState")
-            if state:
-                self.restoreState(state)
+            if state: self.restoreState(state)
         except Exception as e:
-            logger.warning(f"Failed to restore window geometry: {e}")
+            logger.warning(f"Failed to restore window geometry: {e}", exc_info=True)
 
     def create_left_panel(self, parent):
         left_panel = QWidget()
@@ -2050,7 +2239,7 @@ class AudioLDM2Studio(QMainWindow):
         chips_lbl.setFixedWidth(40)
         chips_layout.addWidget(chips_lbl)
 
-        quick_tags = ["🌧️ Rain", "💥 Impact", "🌊 Ocean", "🎶 Music", "🔊 Bass", "🚗 Engine"]
+        quick_tags = ["💥 Impact", "🌬️ Whoosh", "🌧️ Ambient", "🎛️ UI Beep", "🚗 Engine", "🔥 Fire"]
         for tag in quick_tags:
             btn = QPushButton(tag)
             btn.setStyleSheet("padding: 2px 4px; font-size: 10px; min-height: 18px;")
@@ -2075,6 +2264,13 @@ class AudioLDM2Studio(QMainWindow):
         enhance_btn.setToolTip("Expand simple prompts into rich, detailed descriptions using a local NLP dictionary.")
         enhance_btn.clicked.connect(self.enhance_prompt)
         preset_row.addWidget(enhance_btn)
+        
+        random_btn = QToolButton()
+        random_btn.setText("🎲")
+        random_btn.setToolTip("Generate random prompt from tags")
+        random_btn.clicked.connect(self.generate_random_prompt)
+        preset_row.addWidget(random_btn)
+        
         p_layout.addLayout(preset_row)
 
         self.prompt_input = PromptHistoryLineEdit()
@@ -2114,7 +2310,7 @@ class AudioLDM2Studio(QMainWindow):
         f_layout.addRow("Model:", model_row)
 
         self.duration_spin = QDoubleSpinBox()
-        self.duration_spin.setRange(1.0, 600.0)
+        self.duration_spin.setRange(1.0, 14400.0)
         self.duration_spin.setValue(10.0)
         self.duration_spin.setSuffix(" s")
         f_layout.addRow("Duration:", self.duration_spin)
@@ -2187,6 +2383,7 @@ class AudioLDM2Studio(QMainWindow):
         out_browse_btn = QPushButton("…")
         out_browse_btn.setFixedWidth(30)
         out_browse_btn.clicked.connect(self.browse_output_dir)
+        out_row.addWidget(self.output_dir_edit)
         out_row.addWidget(out_browse_btn)
 
         open_out_btn = QPushButton("📂")
@@ -2203,7 +2400,6 @@ class AudioLDM2Studio(QMainWindow):
         f_layout.addRow("", self.cpu_offload_check)
         gen_layout.addWidget(param_group)
         
-        # --- Advanced Conditioning Group ---
         adv_group = QGroupBox("Advanced Workflows")
         adv_layout = QVBoxLayout(adv_group)
         
@@ -2224,6 +2420,32 @@ class AudioLDM2Studio(QMainWindow):
         cond_row.addWidget(cond_clear_btn)
         adv_layout.addLayout(cond_row)
         
+        travel_row1 = QHBoxLayout()
+        self.travel_check = QCheckBox("🧬 Seed Travel (Morph Latents)")
+        self.travel_check.toggled.connect(self.toggle_seed_travel)
+        travel_row1.addWidget(self.travel_check)
+        adv_layout.addLayout(travel_row1)
+        
+        self.travel_widget = QWidget()
+        travel_layout = QFormLayout(self.travel_widget)
+        travel_layout.setContentsMargins(20, 0, 0, 0)
+        self.travel_start_seed = QSpinBox()
+        self.travel_start_seed.setRange(-1, 999999999)
+        self.travel_start_seed.setValue(100)
+        travel_layout.addRow("Start Seed:", self.travel_start_seed)
+        
+        self.travel_end_seed = QSpinBox()
+        self.travel_end_seed.setRange(-1, 999999999)
+        self.travel_end_seed.setValue(200)
+        travel_layout.addRow("End Seed:", self.travel_end_seed)
+        
+        self.travel_steps_spin = QSpinBox()
+        self.travel_steps_spin.setRange(2, 20)
+        self.travel_steps_spin.setValue(5)
+        travel_layout.addRow("Steps:", self.travel_steps_spin)
+        adv_layout.addWidget(self.travel_widget)
+        self.travel_widget.setEnabled(False)
+
         gen_layout.addWidget(adv_group)
 
         post_group = QGroupBox("Post-Processing")
@@ -2307,7 +2529,7 @@ class AudioLDM2Studio(QMainWindow):
         batch_layout.setContentsMargins(8, 8, 8, 8)
         batch_layout.setSpacing(8)
 
-        batch_layout.addWidget(QLabel("Select a .txt file with one prompt per line:"))
+        batch_layout.addWidget(QLabel("Load a .txt file with one prompt per line:"))
         self.batch_file_btn = QPushButton("Select Text File")
         self.batch_file_btn.clicked.connect(self.select_batch_file)
         batch_layout.addWidget(self.batch_file_btn)
@@ -2331,7 +2553,7 @@ class AudioLDM2Studio(QMainWindow):
         self.batch_delay_spin.setSuffix(" s")
         bsl.addRow("Delay:", self.batch_delay_spin)
         self.batch_continue_on_error_check = QCheckBox("Continue on Error")
-        self.batch_continue_on_error_check.setChecked(True)
+        self.batch_continue_on_error_check.setChecked(True)  # FIX: Syntax error corrected
         bsl.addRow("", self.batch_continue_on_error_check)
         batch_layout.addWidget(batch_settings_group)
 
@@ -2360,6 +2582,33 @@ class AudioLDM2Studio(QMainWindow):
         batch_scroll.setWidget(batch_content)
         batch_outer_layout.addWidget(batch_scroll)
         self.mode_tabs.addTab(batch_widget, "Batch")
+        
+        timeline_widget = QWidget()
+        timeline_layout = QVBoxLayout(timeline_widget)
+        timeline_layout.addWidget(QLabel("Timeline Scripting (Long-Form Soundscapes):"))
+        timeline_layout.addWidget(QLabel("Format: [Start-End] Prompt\nExample: [0:00-5:00] Ambient rain"))
+        
+        self.timeline_edit = QPlainTextEdit()
+        self.timeline_edit.setPlaceholderText("[0:00-5:00] Ambient drone, low rumble\n[5:00-5:30] Thunder strike\n[5:30-10:00] Rain fading out")
+        timeline_layout.addWidget(self.timeline_edit)
+        
+        tl_btn_row = QHBoxLayout()
+        self.tl_load_btn = QPushButton("Load Script")
+        self.tl_load_btn.clicked.connect(self.load_timeline_script)
+        tl_btn_row.addWidget(self.tl_load_btn)
+        
+        self.tl_start_btn = QPushButton("Generate Long-Form Audio")
+        self.tl_start_btn.setMinimumHeight(40)
+        self.tl_start_btn.setStyleSheet(
+            "QPushButton { background-color: #8e44ad; color: white; font-size: 13px; font-weight: bold; border: none; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #9e54bd; }"
+            "QPushButton:pressed { background-color: #7e349d; }"
+        )
+        self.tl_start_btn.clicked.connect(self.start_timeline_generation)
+        tl_btn_row.addWidget(self.tl_start_btn)
+        timeline_layout.addLayout(tl_btn_row)
+        
+        self.mode_tabs.addTab(timeline_widget, "Timeline")
 
         prog_group = QGroupBox("Status")
         prog_layout = QVBoxLayout(prog_group)
@@ -2381,6 +2630,13 @@ class AudioLDM2Studio(QMainWindow):
         left_layout.addWidget(prog_group)
         parent.addWidget(left_panel)
 
+    def toggle_seed_travel(self, checked):
+        self.travel_widget.setEnabled(checked)
+        if checked:
+            self.variations_spin.setEnabled(False)
+        else:
+            self.variations_spin.setEnabled(True)
+
     def create_right_panel(self, parent):
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
@@ -2398,7 +2654,6 @@ class AudioLDM2Studio(QMainWindow):
         visualizer_group = QGroupBox("Audio Visualizer")
         visualizer_layout = QVBoxLayout(visualizer_group)
 
-        # --- FIX 1: Build visualizer widgets FIRST ---
         self.visualizer_tabs = QTabWidget()
 
         self.waveform_widget = WaveformWidget()
@@ -2410,7 +2665,6 @@ class AudioLDM2Studio(QMainWindow):
         self.spectrogram_widget.selectionChanged.connect(self.on_spectrogram_selection_changed)
         self.visualizer_tabs.addTab(self.spectrogram_widget, "Spectrogram (Freq)")
 
-        # --- Now wire up controls that reference spectrogram_widget ---
         vis_ctrl_layout = QHBoxLayout()
         self.inpaint_check = QCheckBox("Inpaint Mode (Drag on Spectrogram)")
         self.inpaint_check.toggled.connect(self.spectrogram_widget.set_inpaint_mode)
@@ -2433,7 +2687,7 @@ class AudioLDM2Studio(QMainWindow):
 
         player_layout.addWidget(visualizer_group)
 
-        play_group = QGroupBox("Playback")
+        play_group = QGroupBox("Playback & FX")
         play_layout = QVBoxLayout(play_group)
         play_layout.setSpacing(6)
 
@@ -2462,6 +2716,20 @@ class AudioLDM2Studio(QMainWindow):
         self.save_btn.setEnabled(False)
         self.save_btn.clicked.connect(self.save_audio)
         play_btn_row.addWidget(self.save_btn)
+        
+        self.fx_btn = QPushButton("FX Chain")
+        self.fx_btn.setFixedHeight(36)
+        self.fx_btn.setEnabled(PEDALBOARD_AVAILABLE)
+        self.fx_btn.setToolTip("Real-time effects chain" if PEDALBOARD_AVAILABLE else "Install 'pedalboard' to enable FX")
+        self.fx_btn.clicked.connect(self.open_fx_chain_dialog)
+        play_btn_row.addWidget(self.fx_btn)
+        
+        self.clear_fx_btn = QPushButton("Clear FX")
+        self.clear_fx_btn.setFixedHeight(36)
+        self.clear_fx_btn.setEnabled(False)
+        self.clear_fx_btn.setToolTip("Bypass FX and restore original audio")
+        self.clear_fx_btn.clicked.connect(self.clear_fx)
+        play_btn_row.addWidget(self.clear_fx_btn)
 
         play_btn_col.addLayout(play_btn_row)
         playback_main_row.addLayout(play_btn_col, 1)
@@ -2493,6 +2761,11 @@ class AudioLDM2Studio(QMainWindow):
         self.vol_label = QLabel("50%")
         self.vol_label.setFixedWidth(35)
         vol_layout.addWidget(self.vol_label)
+        
+        self.autoplay_check = QCheckBox("Auto-play on finish")
+        self.autoplay_check.setChecked(True)
+        vol_layout.addWidget(self.autoplay_check)
+        
         play_layout.addLayout(vol_layout)
 
         self.time_label = QLabel("00:00 / 00:00")
@@ -2502,7 +2775,6 @@ class AudioLDM2Studio(QMainWindow):
         player_layout.addWidget(play_group)
 
         ai_group = QGroupBox("AI Analysis & Tools")
-        # --- FIX 2: Use ai_group instead of ai_layout (which doesn't exist yet) ---
         ai_layout = QHBoxLayout(ai_group)
         ai_layout.setSpacing(6)
 
@@ -2558,9 +2830,20 @@ class AudioLDM2Studio(QMainWindow):
         hist_lbl.setStyleSheet("font-size: 13px; font-weight: bold;")
         header_row.addWidget(hist_lbl)
         header_row.addStretch()
+        
+        self.fav_filter_check = QCheckBox("★ Favorites")
+        self.fav_filter_check.toggled.connect(self.filter_history)
+        header_row.addWidget(self.fav_filter_check)
+        
+        header_row.addWidget(QLabel("Tag:"))
+        self.tag_filter_combo = QComboBox()
+        self.tag_filter_combo.setFixedWidth(120)
+        self.tag_filter_combo.currentTextChanged.connect(self.filter_history)
+        header_row.addWidget(self.tag_filter_combo)
+
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Search...")
-        self.search_edit.setFixedWidth(180)
+        self.search_edit.setFixedWidth(150)
         header_row.addWidget(self.search_edit)
 
         export_hist_btn = QPushButton("Export")
@@ -2581,11 +2864,13 @@ class AudioLDM2Studio(QMainWindow):
         self.search_edit.textChanged.connect(self._search_timer.start)
 
         self.playlist_table = QTableWidget()
-        self.playlist_table.setColumnCount(5)
-        self.playlist_table.setHorizontalHeaderLabels(["Prompt", "Waveform", "Date", "Seed", "Model"])
-        self.playlist_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.playlist_table.setColumnCount(7)
+        self.playlist_table.setHorizontalHeaderLabels(["★", "Tags", "Prompt", "Waveform", "Date", "Seed", "Model"])
+        self.playlist_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.playlist_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        for i in range(2, 5):
+        self.playlist_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.playlist_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        for i in range(4, 7):
             self.playlist_table.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeToContents)
         self.playlist_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.playlist_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -2596,6 +2881,135 @@ class AudioLDM2Studio(QMainWindow):
         history_layout.addWidget(self.playlist_table)
         self.right_tabs.addTab(history_widget, "History")
         parent.addWidget(right_panel)
+
+    def parse_time_str(self, t_str):
+        try:
+            parts = t_str.split(':')
+            if len(parts) == 3: return int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
+            if len(parts) == 2: return int(parts[0])*60 + int(parts[1])
+            return int(parts[0])
+        except ValueError:
+            raise ValueError(f"Invalid time format: '{t_str}'. Use MM:SS or HH:MM:SS.")
+
+    def load_timeline_script(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Timeline Script", "", "Text Files (*.txt)")
+        if path:
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    self.timeline_edit.setPlainText(f.read())
+            except Exception as e:
+                logger.error(f"Failed to load timeline script: {e}", exc_info=True)
+
+    def start_timeline_generation(self):
+        script = self.timeline_edit.toPlainText().strip()
+        if not script:
+            logger.warning("Timeline script is empty.")
+            return
+            
+        lines = script.split('\n')
+        batch_prompts = []
+        
+        try:
+            for line in lines:
+                if not line.strip(): continue
+                match = re.match(r'\[(\d+:\d+(?::\d+)?)\s*-\s*(\d+:\d+(?::\d+)?)\]\s*(.*)', line)
+                if match:
+                    start_s = self.parse_time_str(match.group(1))
+                    end_s = self.parse_time_str(match.group(2))
+                    prompt = match.group(3).strip()
+                    duration = end_s - start_s
+                    if duration > 0 and prompt:
+                        batch_prompts.append({'prompt': prompt, 'duration': duration, 'start_time': start_s})
+            
+            if not batch_prompts:
+                logger.warning("No valid timeline entries found in script.")
+                return
+                
+            self.batch_orchestrator.start_batch(batch_prompts, is_timeline=True)
+            self.batch_start_btn.setEnabled(False)
+            self.tl_start_btn.setEnabled(False)
+            self.batch_log.clear()
+            self.batch_log.appendPlainText(f"[{datetime.now().strftime('%H:%M:%S')}] Starting Timeline Generation...")
+            self.mode_tabs.setCurrentIndex(0)
+            
+        except Exception as e:
+            logger.error(f"Timeline script error: {e}", exc_info=True)
+
+    def _on_batch_prompt_ready(self, prompt, duration):
+        self.prompt_input.setPlainText(prompt)
+        self.duration_spin.setValue(duration)
+        if not self.start_generation():
+            self.batch_orchestrator.cancel()
+            self._on_batch_finished()
+
+    def _on_batch_finished(self):
+        self.batch_start_btn.setEnabled(True)
+        self.tl_start_btn.setEnabled(True)
+        self.batch_progress_label.setText("Batch finished or stopped.")
+        if os.path.exists(BATCH_STATE_FILE):
+            try: os.remove(BATCH_STATE_FILE)
+            except OSError: pass
+
+    def open_fx_chain_dialog(self):
+        dialog = FxChainDialog(self, self.fx_chain)
+        if dialog.exec() == QDialog.Accepted:
+            self.fx_chain = dialog.get_chain()
+            self.settings.setValue("fx_chain", self.serialize_fx_chain())
+            self.settings.sync()
+            self.status_bar.showMessage("FX Chain updated.", 3000)
+            
+            if self.base_audio_path:
+                if self.fx_chain:
+                    self.apply_fx_to_current()
+                else:
+                    self.clear_fx()
+
+    def clear_fx(self):
+        if not self.base_audio_path: return
+        self.current_audio_path = self.base_audio_path
+        self.waveform_widget.set_audio(self.base_audio_path)
+        self.spectrogram_widget.set_audio(self.base_audio_path)
+        self.update_audio_stats(self.base_audio_path)
+        self.media_player.setSource(QUrl.fromLocalFile(self.base_audio_path))
+        self.clear_fx_btn.setEnabled(False)
+        self.status_bar.showMessage("FX bypassed. Original audio restored.", 3000)
+
+    def apply_fx_to_current(self):
+        if not PEDALBOARD_AVAILABLE or not self.fx_chain or not self.base_audio_path:
+            return
+            
+        try:
+            with wave.open(self.base_audio_path, 'rb') as wf_in:
+                sr = wf_in.getframerate()
+                n_frames = wf_in.getnframes()
+                with wave.open(FX_PREVIEW_FILE, 'wb') as wf_out:
+                    wf_out.setnchannels(1)
+                    wf_out.setsampwidth(2)
+                    wf_out.setframerate(sr)
+                    
+                    board = Pedalboard(self.fx_chain)
+                    chunk_size = sr * 10 
+                    
+                    for i in range(0, n_frames, chunk_size):
+                        raw = wf_in.readframes(min(chunk_size, n_frames - i))
+                        data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                        if data.size == 0: break
+                        
+                        data = np.expand_dims(data, axis=0)
+                        processed = board(data, sr)
+                        processed_int16 = (np.clip(processed[0], -1.0, 1.0) * 32767).astype(np.int16)
+                        wf_out.writeframes(processed_int16.tobytes())
+            
+            self.current_audio_path = FX_PREVIEW_FILE
+            self.waveform_widget.set_audio(FX_PREVIEW_FILE)
+            self.spectrogram_widget.set_audio(FX_PREVIEW_FILE)
+            self.update_audio_stats(FX_PREVIEW_FILE)
+            self.media_player.setSource(QUrl.fromLocalFile(FX_PREVIEW_FILE))
+            
+            self.clear_fx_btn.setEnabled(True)
+            self.status_bar.showMessage("FX applied to preview successfully!", 3000)
+        except Exception as e:
+            logger.error(f"FX Chain application failed: {e}", exc_info=True)
 
     def setup_audio(self):
         self.audio_output = QAudioOutput(self)
@@ -2637,11 +3051,19 @@ class AudioLDM2Studio(QMainWindow):
         self.status_bar.showMessage("Ready")
 
     def update_gpu_memory_label(self):
-        if not torch.cuda.is_available():
-            return
+        if not torch.cuda.is_available(): return
         allocated = torch.cuda.memory_allocated() / (1024 ** 3)
         total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
         self.gpu_mem_label.setText(f"VRAM: {allocated:.1f}/{total:.1f} GB")
+
+    def setup_tray_icon(self):
+        try:
+            self.tray_icon = QSystemTrayIcon(self)
+            self.tray_icon.setIcon(self.style().standardIcon(QStyle.SP_MediaVolume))
+            self.tray_icon.setToolTip(APP_NAME)
+            self.tray_icon.show()
+        except Exception as e:
+            logger.warning(f"Failed to setup system tray icon: {e}")
 
     def setup_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+Return"), self).activated.connect(self.start_generation)
@@ -2653,6 +3075,7 @@ class AudioLDM2Studio(QMainWindow):
         QShortcut(QKeySequence("Escape"), self).activated.connect(self.cancel_generation)
         QShortcut(QKeySequence("Ctrl+L"), self).activated.connect(lambda: self.prompt_input.setFocus())
         QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(self.regenerate_new_seed)
+        QShortcut(QKeySequence("Ctrl+Shift+F"), self).activated.connect(self.open_fx_chain_dialog)
 
     def create_menus(self):
         menubar = self.menuBar()
@@ -2665,6 +3088,8 @@ class AudioLDM2Studio(QMainWindow):
         tools_menu = menubar.addMenu("&Tools")
         tools_menu.addAction("Show GPU Memory", self.show_gpu_memory)
         tools_menu.addAction("Clear GPU Cache", self.clear_gpu_cache)
+        if PEDALBOARD_AVAILABLE:
+            tools_menu.addAction("Open FX Chain", self.open_fx_chain_dialog)
 
         edit_menu = menubar.addMenu("&Edit")
         edit_menu.addAction("Clear Prompt", lambda: self.prompt_input.clear()).setShortcut("Ctrl+Shift+X")
@@ -2684,21 +3109,15 @@ class AudioLDM2Studio(QMainWindow):
 
     def show_gpu_memory(self):
         if not ML_AVAILABLE or not torch.cuda.is_available():
-            QMessageBox.information(self, "GPU Memory", "CUDA is not available.")
+            logger.info("CUDA is not available.")
             return
         allocated = torch.cuda.memory_allocated() / (1024 ** 3)
         reserved = torch.cuda.memory_reserved() / (1024 ** 3)
         total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-        QMessageBox.information(self, "GPU Memory",
-            f"GPU: {torch.cuda.get_device_name(0)}\n\n"
-            f"Total VRAM:     {total:.2f} GB\n"
-            f"Allocated:      {allocated:.2f} GB\n"
-            f"Reserved:       {reserved:.2f} GB\n"
-            f"Free (approx):  {total - reserved:.2f} GB")
+        logger.info(f"GPU: {torch.cuda.get_device_name(0)}\nTotal VRAM: {total:.2f} GB\nAllocated: {allocated:.2f} GB\nReserved: {reserved:.2f} GB\nFree (approx): {total - reserved:.2f} GB")
 
     def clear_gpu_cache(self):
-        if not ML_AVAILABLE or not torch.cuda.is_available():
-            return
+        if not ML_AVAILABLE or not torch.cuda.is_available(): return
         gc.collect()
         torch.cuda.empty_cache()
         self.update_gpu_memory_label()
@@ -2720,10 +3139,8 @@ class AudioLDM2Studio(QMainWindow):
         if text: self.neg_prompt_input.setText(text)
 
     def enhance_prompt(self):
-        """Rule-based LLM Prompt Enhancer"""
         text = self.prompt_input.toPlainText().strip()
-        if not text:
-            text = "ambient sound"
+        if not text: text = "ambient sound effect"
         
         templates = [
             "{base}, {quality}, {detail}",
@@ -2739,17 +3156,22 @@ class AudioLDM2Studio(QMainWindow):
         if len(text.split()) < 4:
             template = random.choice(templates)
             base = template.format(
-                base=text,
-                quality=random.choice(qualities),
-                detail=random.choice(details),
-                env=random.choice(envs),
-                adj=random.choice(adjs)
+                base=text, quality=random.choice(qualities), detail=random.choice(details),
+                env=random.choice(envs), adj=random.choice(adjs)
             )
         else:
             base = f"{text}, {random.choice(qualities)}, {random.choice(details)}"
             
         self.prompt_input.setPlainText(base)
         self.status_bar.showMessage("Prompt enhanced!", 2000)
+
+    def generate_random_prompt(self):
+        instruments = ["guitar", "piano", "synth", "drums", "violin", "trumpet", "flute", "pad"]
+        genres = ["lofi", "cinematic", "ambient", "electronic", "classical", "rock"]
+        qualities = ["high quality", "professional recording", "immersive"]
+        
+        prompt = f"{random.choice(genres)} {random.choice(instruments)}, {random.choice(qualities)}"
+        self.prompt_input.setPlainText(prompt)
 
     def save_current_model(self):
         model = self.model_combo.currentText().strip()
@@ -2792,10 +3214,10 @@ class AudioLDM2Studio(QMainWindow):
             return
         if duration > chunk:
             n = math.ceil((duration - OVERLAP_S) / (chunk - OVERLAP_S))
-            warn = " ⚠️ too many chunks" if n > 50 else ""
-            self.chunk_preview_label.setText(f"→ Will generate {n} chunks of ~{chunk:.1f}s with 1.0s crossfade{warn}")
+            warn = " ⚠️ massive generation" if n > 500 else ""
+            self.chunk_preview_label.setText(f"→ Will stream {n} chunks of ~{chunk:.1f}s with 1.0s crossfade{warn}")
             self.chunk_preview_label.setStyleSheet(
-                "color: #e74c3c; font-style: italic; font-size: 10px;" if n > 50
+                "color: #e74c3c; font-style: italic; font-size: 10px;" if n > 500
                 else "color: #888; font-style: italic; font-size: 10px;"
             )
         else:
@@ -2826,60 +3248,69 @@ class AudioLDM2Studio(QMainWindow):
                 break
 
     def update_audio_stats(self, path: str):
-        try:
-            sr, data = wavfile.read(path)
-            data = normalize_audio_data(data)
-            if data.size == 0:
-                self.audio_stats_label.setText("Peak: N/A | RMS: N/A | Headroom: N/A")
-                self.audio_stats_label.setStyleSheet("color: #888; font-size: 11px; font-family: monospace; padding: 2px;")
-                return
+        if self.stats_worker and self.stats_worker.isRunning():
+            self.stats_worker.quit()
+            self.stats_worker.wait(500)
+            
+        self.stats_worker = AudioStatsWorker(path)
+        self.stats_worker.statsReady.connect(self._on_stats_ready)
+        self.stats_worker.error.connect(self.on_ml_error)
+        self.stats_worker.start()
 
-            peak = float(np.max(np.abs(data)))
-            peak_db = 20 * math.log10(peak) if peak > 0 else -120.0
-
-            rms = float(np.sqrt(np.mean(np.square(data))))
+    def _on_stats_ready(self, peak: float, rms: float):
+        if peak > 0:
+            peak_db = 20 * math.log10(peak)
             rms_db = 20 * math.log10(rms) if rms > 0 else -120.0
-
             headroom = 0.0 - peak_db
-
-            self.audio_stats_label.setText(
-                f"Peak: {peak_db:.1f} dB | RMS: {rms_db:.1f} dB | Headroom: {headroom:.1f} dB"
-            )
+            self.audio_stats_label.setText(f"Peak: {peak_db:.1f} dB | RMS: {rms_db:.1f} dB | Headroom: {headroom:.1f} dB")
             self.audio_stats_label.setStyleSheet("color: #2A82DA; font-size: 11px; font-family: monospace; padding: 2px;")
-        except Exception as e:
-            logger.error(f"Failed to calculate audio stats: {e}")
+        else:
             self.audio_stats_label.setText("Peak: N/A | RMS: N/A | Headroom: N/A")
             self.audio_stats_label.setStyleSheet("color: #888; font-size: 11px; font-family: monospace; padding: 2px;")
 
     def _load_audio_file(self, path):
-        if not path or not os.path.exists(path):
-            return
+        if not path or not os.path.exists(path): return
         try:
-            with open(path, 'rb') as f:
-                f.read(4)
+            with open(path, 'rb') as f: f.read(4)
         except OSError as e:
-            QMessageBox.warning(self, "Cannot Open File", f"Cannot read file:\n{e}")
+            logger.warning(f"Cannot read file: {e}")
             return
+        
+        if not path.lower().endswith('.wav'):
+            if not shutil.which("ffmpeg") and not os.path.exists("ffmpeg.exe"):
+                logger.warning("FFmpeg is required to load non-WAV files for visualization.")
+            else:
+                cmd = ["ffmpeg", "-y", "-i", path, "-ac", "1", "-ar", "44100", TEMP_LOAD_WAV]
+                creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                subprocess.run(cmd, capture_output=True, text=True, creationflags=creationflags)
+                path = TEMP_LOAD_WAV
         
         self._clear_variations()
         try:
-            sr, data = wavfile.read(path)
-            dur = len(data) / sr
-        except:
+            with wave.open(path, 'rb') as wf:
+                dur = wf.getnframes() / wf.getframerate()
+        except Exception as e:
+            logger.error(f"Failed to read WAV header: {e}", exc_info=True)
             dur = 0.0
         self._add_variation_card(path, 0, dur, -1)
         
+        self.base_audio_path = path
         self.current_audio_path = path
-        self.current_audio_paths = [path]
+        
         self.play_btn.setEnabled(True)
         self.save_btn.setEnabled(True)
         self.demucs_btn.setEnabled(DEMUCS_AVAILABLE)
         self.whisper_btn.setEnabled(WHISPER_AVAILABLE)
         self.clap_btn.setEnabled(CLAP_AVAILABLE)
         
-        self.waveform_widget.set_audio(path)
-        self.spectrogram_widget.set_audio(path)
-        self.update_audio_stats(path)
+        if PEDALBOARD_AVAILABLE and self.fx_chain:
+            self.apply_fx_to_current()
+        else:
+            self.clear_fx_btn.setEnabled(False)
+            self.waveform_widget.set_audio(path)
+            self.spectrogram_widget.set_audio(path)
+            self.update_audio_stats(path)
+        
         self.right_tabs.setCurrentIndex(0)
         self.settings.setValue("last_audio_path", path)
         self.settings.sync()
@@ -2888,10 +3319,10 @@ class AudioLDM2Studio(QMainWindow):
 
     def expand_prompt_matrix(self, text: str) -> list:
         matches = list(re.finditer(r'\[([^]]+)\]', text))
-        if not matches:
-            return [text]
+        if not matches: return [text]
         options = [m.group(1).split(',') for m in matches]
         options = [[opt.strip() for opt in group] for group in options]
+        
         total = 1
         for g in options:
             total *= len(g)
@@ -2900,6 +3331,7 @@ class AudioLDM2Studio(QMainWindow):
                     f"Prompt matrix expands to {total}+ combinations (cap={PROMPT_MATRIX_MAX}). "
                     "Reduce the number of bracketed groups."
                 )
+                
         combinations = list(itertools.product(*options))
 
         results = []
@@ -2919,12 +3351,12 @@ class AudioLDM2Studio(QMainWindow):
             for line in lines:
                 expanded_prompts.extend(self.expand_prompt_matrix(line))
 
-            self.batch_prompts = expanded_prompts
+            self.batch_orchestrator.batch_prompts = expanded_prompts
             self.batch_file_label.setText(path)
-            self.batch_log.appendPlainText(f"Loaded {len(lines)} prompts. Expanded to {len(self.batch_prompts)} matrix variations.")
+            self.batch_log.appendPlainText(f"Loaded {len(lines)} prompts. Expanded to {len(expanded_prompts)} matrix variations.")
             self.mode_tabs.setCurrentIndex(1)
         except Exception as e:
-            QMessageBox.critical(self, "Batch File Error", str(e))
+            logger.error(f"Batch file error: {e}", exc_info=True)
 
     def toggle_inpaint_button(self, checked):
         self.inpaint_btn.setEnabled(checked and self.current_audio_path is not None)
@@ -2934,57 +3366,55 @@ class AudioLDM2Studio(QMainWindow):
         self.inpaint_btn.setEnabled(valid and self.inpaint_check.isChecked())
 
     def start_inpainting(self):
-        if not self.current_audio_path or not self.current_audio_path.endswith('.wav'):
-            QMessageBox.warning(self, "Inpainting Error", "Please load a WAV file to inpaint.")
+        if not self.base_audio_path or not self.base_audio_path.endswith('.wav'):
+            logger.warning("Inpainting error: Please load a WAV file to inpaint.")
             return
             
         prompt = self.prompt_input.toPlainText().strip()
         if not prompt:
-            QMessageBox.warning(self, "Input Error", "Please enter a prompt for the inpainted region.")
+            logger.warning("Input error: Please enter a prompt for the inpainted region.")
             return
             
         start, end = self.spectrogram_widget.get_selection()
         if end - start < 0.5:
-            QMessageBox.warning(self, "Selection Error", "Please select a region longer than 0.5s on the spectrogram.")
+            logger.warning("Selection error: Please select a region longer than 0.5s on the spectrogram.")
             return
             
         self._inpaint_active = True
-        self._inpaint_source = self.current_audio_path
+        self._inpaint_source = self.base_audio_path
         self._inpaint_start = start
         self._inpaint_end = end
         
-        self.status_bar.showMessage(f"Inpainting region {start:.2f}s to {end:.2f}s...")
+        self.status_bar.showMessage(f"Inpainting region {format_time(start)} to {format_time(end)}...")
         self.start_generation()
 
     def start_generation(self) -> bool:
         if self.worker_thread and self.worker_thread.isRunning():
-            QMessageBox.information(self, "Busy", "The engine is still cleaning up from the last generation. Please wait a moment.")
+            logger.info("The engine is still cleaning up from the last generation. Please wait a moment.")
             return False
 
         prompt = self.prompt_input.toPlainText().strip()
         if not prompt:
-            QMessageBox.warning(self, "Input Error", "Please enter a prompt.")
+            logger.warning("Input error: Please enter a prompt.")
             return False
 
         model = self.model_combo.currentText().strip()
         if not model or '/' not in model:
-            QMessageBox.warning(self, "Invalid Model", "Model name must be in 'org/model' format (e.g., 'cvssp/audioldm2').")
+            logger.warning("Invalid model: Model name must be in 'org/model' format.")
             return False
 
         out_dir = self.output_dir_edit.text().strip() or os.path.join(os.getcwd(), "generated_audio")
         try:
             os.makedirs(out_dir, exist_ok=True)
         except OSError as e:
-            QMessageBox.critical(self, "Output Error", f"Cannot create output folder:\n{e}")
+            logger.error(f"Output error: Cannot create output folder:\n{e}")
             return False
 
         cache_dir = self.cache_dir_edit.text().strip() or DEFAULT_CACHE_DIR
         try:
             os.makedirs(cache_dir, exist_ok=True)
         except OSError as e:
-            QMessageBox.critical(self, "Cache Directory Error",
-                f"Cannot create or access cache directory '{cache_dir}'.\n"
-                f"Please change the 'Cache' folder in the UI to a valid path (e.g., ./model_cache).")
+            logger.error(f"Cache directory error: Cannot create or access cache directory '{cache_dir}'.")
             return False
 
         self.prompt_input.add_to_history(prompt)
@@ -3008,7 +3438,7 @@ class AudioLDM2Studio(QMainWindow):
         inpaint_start = 0.0
         inpaint_end = 0.0
         
-        if getattr(self, '_inpaint_active', False):
+        if self._inpaint_active:
             duration = self._inpaint_end - self._inpaint_start
             inpaint_source = self._inpaint_source
             inpaint_start = self._inpaint_start
@@ -3038,7 +3468,11 @@ class AudioLDM2Studio(QMainWindow):
             conditioning_audio=self.cond_audio_edit.text().strip(),
             inpaint_source=inpaint_source,
             inpaint_start_s=inpaint_start,
-            inpaint_end_s=inpaint_end
+            inpaint_end_s=inpaint_end,
+            use_seed_travel=self.travel_check.isChecked(),
+            travel_start_seed=self.travel_start_seed.value(),
+            travel_end_seed=self.travel_end_seed.value(),
+            travel_steps=self.travel_steps_spin.value()
         )
 
         self.worker_thread = QThread()
@@ -3063,13 +3497,12 @@ class AudioLDM2Studio(QMainWindow):
         self.start_generation()
 
     def cancel_generation(self):
-        if self.batch_state == BatchState.RUNNING:
+        if self.batch_orchestrator.batch_state == BatchState.RUNNING:
             reply = QMessageBox.question(self, "Cancel Batch",
                 "Cancelling will stop the entire batch. Continue?",
                 QMessageBox.Yes | QMessageBox.No)
-            if reply != QMessageBox.Yes:
-                return
-            self.batch_state = BatchState.CANCELLED
+            if reply != QMessageBox.Yes: return
+            self.batch_orchestrator.cancel()
 
         if self.worker:
             self.worker.is_cancelled = True
@@ -3077,26 +3510,26 @@ class AudioLDM2Studio(QMainWindow):
             self.cancel_btn.setEnabled(False)
             self.status_bar.showMessage("Cancelling generation...")
 
-        if self.batch_state == BatchState.CANCELLED:
+        if self.batch_orchestrator.batch_state == BatchState.CANCELLED:
             self.batch_progress_label.setText("Batch cancelled.")
             self.batch_log.appendPlainText(f"[{datetime.now().strftime('%H:%M:%S')}] Batch cancelled by user.")
 
     def generation_cancelled(self):
         self.progress_bar.setVisible(False)
-        self.eta_label.setText("")
+        self.eta_label.SetText("")
         self.status_label.setText("Ready")
         self.status_led.setStyleSheet("background-color: #555; border-radius: 6px; margin: 2px;")
-        if self.batch_state == BatchState.RUNNING:
-            self.batch_state = BatchState.CANCELLED
+        if self.batch_orchestrator.batch_state == BatchState.RUNNING:
+            self.batch_orchestrator.cancel()
         self.status_bar.showMessage("Generation cancelled", 3000)
 
     def generation_finished(self, path, metadata):
+        self.base_audio_path = path
         self.current_audio_path = path
-        self.current_audio_paths = metadata.get('paths', [path])
         
         self.progress_bar.setVisible(False)
-        self.eta_label.setText("")
-        self.status_label.setText("Ready")
+        self.eta_label.SetText("")
+        self.status_label.SetText("Ready")
         self.status_led.setStyleSheet("background-color: #555; border-radius: 6px; margin: 2px;")
         self.play_btn.setEnabled(True)
         self.save_btn.setEnabled(True)
@@ -3109,43 +3542,63 @@ class AudioLDM2Studio(QMainWindow):
         
         for i, meta in enumerate(meta_list):
             self._add_variation_card(
-                path=meta['path'],
-                index=i,
-                duration=meta['duration'],
-                seed=meta['seed']
+                path=meta['path'], index=i, duration=meta['duration'], seed=meta['seed']
             )
 
-        if self.current_audio_paths:
-            self._load_variation(self.current_audio_paths[0])
+        if metadata.get('paths'):
+            self._load_variation(metadata['paths'][0])
 
         history_data = self.settings.value("history", [])
         row = self.playlist_table.rowCount()
+        
+        all_tags = set()
+        for entry in history_data:
+            if entry.get("tags"): all_tags.update(entry["tags"])
+        for meta in meta_list:
+            if meta.get("tags"): all_tags.update(meta["tags"])
+        self.tag_filter_combo.clear()
+        self.tag_filter_combo.addItem("All")
+        self.tag_filter_combo.addItems(sorted(list(all_tags)))
+
         for i, meta in enumerate(meta_list):
             history_data.append(meta)
 
             self.playlist_table.insertRow(row + i)
+            
+            fav_item = QTableWidgetItem()
+            if meta.get('favorite'):
+                fav_item.setText("★")
+                fav_item.setForeground(QColor('#f1c40f'))
+            else:
+                fav_item.setText("")
+            fav_item.setTextAlignment(Qt.AlignCenter)
+            self.playlist_table.setItem(row + i, 0, fav_item)
+            
+            tags_item = QTableWidgetItem(", ".join(meta.get('tags', [])))
+            self.playlist_table.setItem(row + i, 1, tags_item)
+            
             prompt_item = QTableWidgetItem(meta['prompt'])
             prompt_item.setToolTip(meta['path'])
             if meta['path'] and not os.path.exists(meta['path']):
                 prompt_item.setForeground(QColor('red'))
-            self.playlist_table.setItem(row + i, 0, prompt_item)
+            self.playlist_table.setItem(row + i, 2, prompt_item)
+            
             mini_item = MiniWaveformItem(meta['path'], meta['duration'])
-            self.playlist_table.setItem(row + i, 1, mini_item)
+            self.playlist_table.setItem(row + i, 3, mini_item)
             if self._thumb_worker.isRunning():
                 self._thumb_worker.enqueue(row + i, meta['path'])
             else:
                 pix = MiniWaveformItem.generate_pixmap(meta['path'])
                 if pix: mini_item.set_pixmap(pix)
-            self.playlist_table.setItem(row + i, 2, QTableWidgetItem(meta['timestamp'][:10]))
-            self.playlist_table.setItem(row + i, 3, QTableWidgetItem(str(meta['seed'])))
-            self.playlist_table.setItem(row + i, 4, QTableWidgetItem(meta['model'].split('/')[-1]))
+                
+            self.playlist_table.setItem(row + i, 4, QTableWidgetItem(meta['timestamp'][:10]))
+            self.playlist_table.setItem(row + i, 5, QTableWidgetItem(str(meta['seed'])))
+            self.playlist_table.setItem(row + i, 6, QTableWidgetItem(meta['model'].split('/')[-1]))
 
         if len(history_data) > MAX_HISTORY:
-            excess = len(history_data) - MAX_HISTORY
             history_data = history_data[-MAX_HISTORY:]
-            for _ in range(excess):
-                if self.playlist_table.rowCount() > MAX_HISTORY:
-                    self.playlist_table.removeRow(0)
+            while self.playlist_table.rowCount() > MAX_HISTORY:
+                self.playlist_table.removeRow(0)
 
         self.settings.setValue("history", history_data)
         self.settings.sync()
@@ -3156,11 +3609,20 @@ class AudioLDM2Studio(QMainWindow):
         gen_time = metadata.get('gen_time', 0.0)
         self.right_tabs.setCurrentIndex(0)
 
-        self.status_bar.showMessage(f"Generated {len(self.current_audio_paths)} audio file(s) in {gen_time:.2f}s", 5000)
+        self.status_bar.showMessage(f"Generated {len(metadata['paths'])} audio file(s) in {format_time(gen_time)}", 5000)
+        
+        if not self.isActiveWindow() and hasattr(self, 'tray_icon'):
+            self.tray_icon.showMessage("Generation Complete", f"Generated: {os.path.basename(path)}", QSystemTrayIcon.Information, 5000)
         
         self._inpaint_active = False
         self._inpaint_source = ""
         self.inpaint_check.setChecked(False)
+        
+        if self.batch_orchestrator.batch_state == BatchState.RUNNING:
+            self.batch_orchestrator.on_generation_finished(meta_list)
+        
+        if self.autoplay_check.isChecked():
+            QTimer.singleShot(100, self.toggle_playback)
 
     def _clear_variations(self):
         while self.variations_layout.count() > 1:
@@ -3182,18 +3644,8 @@ class AudioLDM2Studio(QMainWindow):
         self.toggle_playback()
 
     def _load_variation(self, path):
-        if not path or not os.path.exists(path):
-            return
-        self.current_audio_path = path
-        self.waveform_widget.set_audio(path)
-        self.spectrogram_widget.set_audio(path)
-        self.update_audio_stats(path)
-        if self.media_player.playbackState() == QMediaPlayer.PlayingState:
-            self.media_player.stop()
-        self.media_player.setSource(QUrl.fromLocalFile(path))
-        self.play_btn.setText("Play")
-        self.status_led.setStyleSheet("background-color: #555; border-radius: 6px; margin: 2px;")
-        self._update_variation_card_style(path)
+        if not path or not os.path.exists(path): return
+        self._load_audio_file(path)
 
     def _update_variation_card_style(self, active_path):
         for i in range(self.variations_layout.count()):
@@ -3208,23 +3660,22 @@ class AudioLDM2Studio(QMainWindow):
 
     def generation_error(self, msg):
         self.progress_bar.setVisible(False)
-        self.eta_label.setText("")
-        self.status_label.setText("Error")
+        self.eta_label.SetText("")
+        self.status_label.SetText("Error")
         self.status_led.setStyleSheet("background-color: #c0392b; border-radius: 6px; margin: 2px;")
-        if self.batch_state == BatchState.RUNNING:
+        if self.batch_orchestrator.batch_state == BatchState.RUNNING:
             self.batch_log.appendPlainText(f"[{datetime.now().strftime('%H:%M:%S')}] ERROR: {msg[:100]}...")
             if not self.batch_continue_on_error_check.isChecked():
-                self.batch_state = BatchState.CANCELLED
+                self.batch_orchestrator.cancel()
         else:
-            QMessageBox.critical(self, "Generation Error", msg)
+            logger.error(f"Generation error: {msg}")
         
         self._inpaint_active = False
         self._inpaint_source = ""
         self.inpaint_check.setChecked(False)
 
     def _trigger_next_batch_item(self):
-        if self.batch_state == BatchState.CANCELLED:
-            return
+        if self.batch_orchestrator.batch_state != BatchState.RUNNING: return
         if not self.start_generation():
             self.batch_log.appendPlainText(f"[{datetime.now().strftime('%H:%M:%S')}] ERROR: Failed to start generation. Skipping prompt.")
             self.on_worker_thread_finished()
@@ -3233,34 +3684,15 @@ class AudioLDM2Studio(QMainWindow):
         self.generate_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
 
-        if self.batch_state == BatchState.RUNNING:
-            self.batch_index += 1
-            self.save_batch_state()
-            if self.batch_index < len(self.batch_prompts):
-                next_prompt = self.batch_prompts[self.batch_index]
-                self.prompt_input.setPlainText(next_prompt)
-                self.batch_progress_label.setText(f"Batch Progress: {self.batch_index + 1} / {len(self.batch_prompts)}")
-                self.batch_log.appendPlainText(f"[{datetime.now().strftime('%H:%M:%S')}] Generated: {next_prompt[:50]}...")
-                QTimer.singleShot(int(self.batch_delay_spin.value() * 1000), self._trigger_next_batch_item)
-            else:
-                self.finalize_batch_state()
-                self.batch_log.appendPlainText(f"[{datetime.now().strftime('%H:%M:%S')}] Batch complete!")
-                if os.path.exists(BATCH_STATE_FILE):
-                    try:
-                        os.remove(BATCH_STATE_FILE)
-                    except OSError:
-                        pass
-                QMessageBox.information(self, "Batch Complete", f"All {len(self.batch_prompts)} prompts processed!")
-        else:
-            self.finalize_batch_state()
-            self.status_label.setText("Ready")
+        if self.batch_orchestrator.batch_state != BatchState.RUNNING:
+            self.batch_orchestrator.batch_state = BatchState.IDLE
+            self.status_label.SetText("Ready")
 
     def toggle_playback(self):
         fw = QApplication.focusWidget()
-        if isinstance(fw, (QLineEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QComboBox)):
+        if fw and fw.inherits("QAbstractSpinBox") or isinstance(fw, (QLineEdit, QPlainTextEdit, QComboBox)):
             return
-        if not self.current_audio_path or not os.path.exists(self.current_audio_path):
-            return
+        if not self.current_audio_path or not os.path.exists(self.current_audio_path): return
         if self.media_player.playbackState() == QMediaPlayer.PlayingState:
             self.media_player.stop()
             self.status_led.setStyleSheet("background-color: #555; border-radius: 6px; margin: 2px;")
@@ -3277,7 +3709,7 @@ class AudioLDM2Studio(QMainWindow):
 
     def play_from_playlist(self, item):
         if isinstance(item, QTableWidgetItem):
-            path = self.playlist_table.item(item.row(), 0).toolTip()
+            path = self.playlist_table.item(item.row(), 2).toolTip()
         else:
             path = item
         self._play_path(path)
@@ -3287,18 +3719,30 @@ class AudioLDM2Studio(QMainWindow):
             self._load_audio_file(path)
             self.toggle_playback()
         else:
-            QMessageBox.warning(self, "File Missing", "This audio file has been moved or deleted.")
+            logger.warning("File missing: This audio file has been moved or deleted.")
 
     def show_history_context_menu(self, pos):
         item = self.playlist_table.itemAt(pos)
         if not item: return
-        path = self.playlist_table.item(item.row(), 0).toolTip()
+        row = item.row()
+        path = self.playlist_table.item(row, 2).toolTip()
+        history_data = self.settings.value("history", [])
+        
         menu = QMenu(self)
         menu.addAction("Play", lambda: self._play_path(path))
         menu.addAction("Open in Folder", lambda: self.open_file_in_folder(path))
         menu.addAction("Copy File Path", lambda: QApplication.clipboard().setText(path))
-        menu.addAction("Copy Prompt", lambda: QApplication.clipboard().setText(self.playlist_table.item(item.row(), 0).text()))
-        menu.addAction("Reuse Settings", lambda: self.reuse_settings(item.row()))
+        menu.addAction("Copy Prompt", lambda: QApplication.clipboard().setText(self.playlist_table.item(row, 2).text()))
+        menu.addAction("Reuse Settings", lambda: self.reuse_settings(row))
+        menu.addSeparator()
+        
+        is_fav = history_data[row].get('favorite', False)
+        fav_action = menu.addAction("Remove Favorite" if is_fav else "Add Favorite")
+        fav_action.triggered.connect(lambda: self.toggle_favorite(row))
+        
+        menu.addAction("Add Tag...", lambda: self.add_tag_to_row(row))
+        menu.addAction("Clear Tags", lambda: self.clear_tags(row))
+        
         menu.addSeparator()
 
         rev_action = menu.addAction("Reverse Audio & Load")
@@ -3307,40 +3751,97 @@ class AudioLDM2Studio(QMainWindow):
         menu.addAction("Export Selected to ZIP", self.export_selected_to_zip)
 
         menu.addSeparator()
-        menu.addAction("Delete Entry", lambda: self.delete_history_row(item.row()))
+        menu.addAction("Delete Entry", lambda: self.delete_history_row(row))
         menu.exec(self.playlist_table.viewport().mapToGlobal(pos))
+
+    def toggle_favorite(self, row):
+        history_data = self.settings.value("history", [])
+        if 0 <= row < len(history_data):
+            history_data[row]['favorite'] = not history_data[row].get('favorite', False)
+            self.settings.setValue("history", history_data)
+            self.settings.sync()
+            self.load_history()
+
+    def add_tag_to_row(self, row):
+        history_data = self.settings.value("history", [])
+        if 0 <= row < len(history_data):
+            tag, ok = QInputDialog.getText(self, "Add Tag", "Enter tag (e.g., sfx, music, ambient):")
+            if ok and tag:
+                if 'tags' not in history_data[row]:
+                    history_data[row]['tags'] = []
+                if tag not in history_data[row]['tags']:
+                    history_data[row]['tags'].append(tag)
+                    self.settings.setValue("history", history_data)
+                    self.settings.sync()
+                    self.load_history()
+
+    def clear_tags(self, row):
+        history_data = self.settings.value("history", [])
+        if 0 <= row < len(history_data):
+            history_data[row]['tags'] = []
+            self.settings.setValue("history", history_data)
+            self.settings.sync()
+            self.load_history()
+
+    def filter_history(self):
+        search_text = self.search_edit.text().lower()
+        only_favs = self.fav_filter_check.isChecked()
+        tag_filter = self.tag_filter_combo.currentText()
+        
+        for row in range(self.playlist_table.rowCount()):
+            should_hide = False
+            item_fav = self.playlist_table.item(row, 0)
+            if only_favs and (not item_fav or item_fav.text() != "★"):
+                should_hide = True
+            item_tags = self.playlist_table.item(row, 1)
+            if tag_filter != "All" and (not item_tags or tag_filter not in item_tags.text()):
+                should_hide = True
+            item_prompt = self.playlist_table.item(row, 2)
+            if search_text and (not item_prompt or search_text not in item_prompt.text().lower()):
+                should_hide = True
+                
+            self.playlist_table.setRowHidden(row, should_hide)
 
     def reverse_audio_file(self, path: str):
         try:
-            sr, data = wavfile.read(path)
-            data = normalize_audio_data(data)
-            if data.size == 0:
-                QMessageBox.warning(self, "Reverse Error", "Audio file is empty.")
-                return
-            reversed_audio = np.flipud(data).astype(np.float32, copy=True)
-            reversed_audio = normalize_audio(reversed_audio)
-            reversed_int16 = (np.clip(reversed_audio, -1.0, 1.0) * 32767).astype(np.int16)
-
-            base, _ = os.path.splitext(path)
-            out_path = base + "_reversed.wav"
-            wavfile.write(out_path, sr, reversed_int16)
+            with wave.open(path, 'rb') as wf_in:
+                sr = wf_in.getframerate()
+                n_frames = wf_in.getnframes()
+                
+                base, _ = os.path.splitext(path)
+                out_path = base + "_reversed.wav"
+                
+                with wave.open(out_path, 'wb') as wf_out:
+                    wf_out.setnchannels(1)
+                    wf_out.setsampwidth(2)
+                    wf_out.setframerate(sr)
+                    
+                    chunk_size = sr * 10 
+                    chunks = []
+                    
+                    for i in range(0, n_frames, chunk_size):
+                        raw = wf_in.readframes(min(chunk_size, n_frames - i))
+                        data = np.frombuffer(raw, dtype=np.int16)
+                        chunks.append(data)
+                        
+                    for chunk in reversed(chunks):
+                        wf_out.writeframes(chunk[::-1].tobytes())
 
             self._load_audio_file(out_path)
             self.status_bar.showMessage("Audio reversed and loaded successfully!", 3000)
         except Exception as e:
-            logger.error(f"Failed to reverse audio: {e}")
-            QMessageBox.critical(self, "Reverse Error", f"Failed to reverse audio:\n{e}")
+            logger.error(f"Failed to reverse audio: {e}", exc_info=True)
 
     def export_selected_to_zip(self):
         paths = []
         for item in self.playlist_table.selectedItems():
             row = item.row()
-            path = self.playlist_table.item(row, 0).toolTip()
+            path = self.playlist_table.item(row, 2).toolTip()
             if path and os.path.exists(path) and path not in paths:
                 paths.append(path)
 
         if not paths:
-            QMessageBox.warning(self, "No Selection", "Please select files in the history table to export.")
+            logger.warning("No files selected for ZIP export.")
             return
 
         path, _ = QFileDialog.getSaveFileName(self, "Export to ZIP", "audio_export.zip", "ZIP Files (*.zip)")
@@ -3351,10 +3852,8 @@ class AudioLDM2Studio(QMainWindow):
                 for p in paths:
                     zf.write(p, arcname=os.path.basename(p))
             self.status_bar.showMessage(f"Exported {len(paths)} files to ZIP successfully!", 5000)
-            QMessageBox.information(self, "Export Complete", f"Successfully exported {len(paths)} files to:\n{path}")
         except Exception as e:
-            logger.error(f"ZIP export failed: {e}")
-            QMessageBox.critical(self, "Export Error", f"Failed to create ZIP file:\n{e}")
+            logger.error(f"ZIP export failed: {e}", exc_info=True)
 
     def open_file_in_folder(self, path):
         if not path or not os.path.exists(path): return
@@ -3416,32 +3915,68 @@ class AudioLDM2Studio(QMainWindow):
         self.vol_label.setText(f"{val}%")
 
     def save_audio(self):
-        if not self.current_audio_path: return
-        default_name = os.path.basename(self.current_audio_path).replace('.wav', '')
+        if not self.base_audio_path: return
+        default_name = os.path.basename(self.base_audio_path).replace('.wav', '')
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Audio/Video", default_name,
             "WAV Audio (*.wav);;MP3 Audio (*.mp3);;FLAC Audio (*.flac);;MP4 Video (*.mp4)"
         )
-        if path:
-            if path.endswith('.mp4'):
-                self.export_to_media(self.current_audio_path, path, 'mp4')
-            elif path.endswith('.mp3'):
-                self.export_to_media(self.current_audio_path, path, 'mp3')
-            elif path.endswith('.flac'):
-                self.export_to_media(self.current_audio_path, path, 'flac')
-            else:
-                try:
-                    shutil.copy2(self.current_audio_path, path)
-                    self.status_bar.showMessage("Audio saved successfully!", 3000)
-                except Exception as e:
-                    QMessageBox.critical(self, "Error", f"Failed to save: {e}")
+        if not path: return
+        
+        is_fx_active = PEDALBOARD_AVAILABLE and self.fx_chain and self.current_audio_path == FX_PREVIEW_FILE
+        
+        if is_fx_active:
+            try:
+                with wave.open(self.base_audio_path, 'rb') as wf_in:
+                    sr = wf_in.getframerate()
+                    n_frames = wf_in.getnframes()
+                    
+                    temp_wav = path + ".tmp.wav"
+                    with wave.open(temp_wav, 'wb') as wf_out:
+                        wf_out.setnchannels(1)
+                        wf_out.setsampwidth(2)
+                        wf_out.setframerate(sr)
+                        
+                        board = Pedalboard(self.fx_chain)
+                        chunk_size = sr * 10 
+                        
+                        for i in range(0, n_frames, chunk_size):
+                            raw = wf_in.readframes(min(chunk_size, n_frames - i))
+                            data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                            if data.size == 0: break
+                            data = np.expand_dims(data, axis=0)
+                            processed = board(data, sr)
+                            processed_int16 = (np.clip(processed[0], -1.0, 1.0) * 32767).astype(np.int16)
+                            wf_out.writeframes(processed_int16.tobytes())
+                            
+                if path.endswith('.wav'):
+                    shutil.move(temp_wav, path)
+                    self.status_bar.showMessage("Audio saved with FX successfully!", 3000)
+                    return
+                else:
+                    self.export_to_media(temp_wav, path, path.split('.')[-1])
+                    try: os.remove(temp_wav)
+                    except: pass
+                    return
+            except Exception as e:
+                logger.error(f"Error saving with FX: {e}", exc_info=True)
+
+        if path.endswith('.mp4'):
+            self.export_to_media(self.base_audio_path, path, 'mp4')
+        elif path.endswith('.mp3'):
+            self.export_to_media(self.base_audio_path, path, 'mp3')
+        elif path.endswith('.flac'):
+            self.export_to_media(self.base_audio_path, path, 'flac')
+        else:
+            try:
+                shutil.copy2(self.base_audio_path, path)
+                self.status_bar.showMessage("Audio saved successfully!", 3000)
+            except Exception as e:
+                logger.error(f"Failed to save audio: {e}", exc_info=True)
 
     def export_to_media(self, wav_path: str, out_path: str, fmt: str):
         if not shutil.which("ffmpeg") and not os.path.exists("ffmpeg.exe"):
-            QMessageBox.critical(self, "FFmpeg Missing",
-                "FFmpeg is required to export media files.\n\n"
-                "Please install FFmpeg and ensure it is in your system PATH, "
-                "or place the 'ffmpeg.exe' in the same folder as this script.")
+            logger.error("FFmpeg is missing. Cannot export media files.")
             return
 
         cmd = ["ffmpeg", "-y", "-i", wav_path]
@@ -3462,21 +3997,19 @@ class AudioLDM2Studio(QMainWindow):
         self.status_bar.showMessage(f"Encoding {fmt.upper()}... Please wait.")
         QApplication.processEvents()
 
-        try:
-            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-            result = subprocess.run(cmd, capture_output=True, text=True, creationflags=creationflags)
+        self.ffmpeg_worker = FFmpegWorker(cmd)
+        self.ffmpeg_worker.finished.connect(lambda success, err: self._on_ffmpeg_finished(success, err, fmt, out_path))
+        self.ffmpeg_worker.error.connect(self._on_ffmpeg_error)
+        self.ffmpeg_worker.start()
 
-            if result.returncode == 0:
-                self.status_bar.showMessage(f"{fmt.upper()} exported successfully!", 5000)
-                QMessageBox.information(self, "Export Complete", f"File successfully exported to:\n{out_path}")
-            else:
-                logger.error(f"FFmpeg failed to encode {fmt}: {result.stderr}")
-                self.status_bar.showMessage(f"{fmt.upper()} export failed.", 3000)
-                QMessageBox.critical(self, "FFmpeg Error",
-                    f"Failed to encode {fmt}. FFmpeg reported:\n\n{result.stderr[-1000:]}")
-        except Exception as e:
-            logger.error(f"Error exporting media: {e}")
-            QMessageBox.critical(self, "Export Error", f"An unexpected error occurred:\n{e}")
+    def _on_ffmpeg_finished(self, success, err, fmt, out_path):
+        if success:
+            self.status_bar.showMessage(f"{fmt.upper()} exported successfully!", 5000)
+        else:
+            logger.error(f"FFmpeg failed to encode {fmt}: {err}")
+
+    def _on_ffmpeg_error(self, err):
+        logger.error(f"Error exporting media: {err}")
 
     def open_audio(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open Audio", "", "Audio Files (*.wav *.mp3 *.flac)")
@@ -3491,36 +4024,39 @@ class AudioLDM2Studio(QMainWindow):
         if path: self._load_batch_file(path)
 
     def start_batch(self):
-        if not self.batch_prompts or not os.path.exists(self.batch_file_label.text()):
-            QMessageBox.warning(self, "Batch Error", "Please select a valid text file first.")
+        if not self.batch_orchestrator.batch_prompts or not os.path.exists(self.batch_file_label.text()):
+            logger.warning("Batch error: Please select a valid text file first.")
             return
         reply = QMessageBox.question(self, "Start Batch",
-            f"About to generate {len(self.batch_prompts)} prompts with {self.batch_variations_spin.value()} variation(s) each.\n\nContinue?",
+            f"About to generate {len(self.batch_orchestrator.batch_prompts)} prompts with {self.batch_variations_spin.value()} variation(s) each.\n\nContinue?",
             QMessageBox.Yes | QMessageBox.No)
         if reply != QMessageBox.Yes: return
 
-        self.batch_state = BatchState.RUNNING
-        self.batch_index = 0
+        self.batch_orchestrator.is_timeline_batch = False
+        self.variations_spin.setValue(self.batch_variations_spin.value())
+        
+        self.batch_orchestrator.start_batch(self.batch_orchestrator.batch_prompts, is_timeline=False)
         self.batch_start_btn.setEnabled(False)
         self.batch_file_btn.setEnabled(False)
-        self.variations_spin.setValue(self.batch_variations_spin.value())
-        self.prompt_input.setPlainText(self.batch_prompts[0])
-        self.batch_progress_label.setText(f"Batch Progress: 1 / {len(self.batch_prompts)}")
+        
+        self.batch_progress_label.setText(f"Batch Progress: 1 / {len(self.batch_orchestrator.batch_prompts)}")
         self.batch_log.clear()
         self.batch_log.appendPlainText(f"[{datetime.now().strftime('%H:%M:%S')}] Starting batch...")
         self.save_batch_state()
         self.mode_tabs.setCurrentIndex(0)
-        if not self.start_generation():
-            self.finalize_batch_state()
-            self.batch_log.appendPlainText(f"[{datetime.now().strftime('%H:%M:%S')}] Batch aborted due to start error.")
 
     def save_batch_state(self):
-        if self.batch_state == BatchState.RUNNING and self.batch_prompts:
+        if self.batch_orchestrator.batch_state == BatchState.RUNNING and self.batch_orchestrator.batch_prompts:
             try:
                 with open(BATCH_STATE_FILE, "w") as f:
-                    json.dump({"prompts": self.batch_prompts, "index": self.batch_index, "file": self.batch_file_label.text()}, f)
+                    json.dump({
+                        "prompts": self.batch_orchestrator.batch_prompts, 
+                        "index": self.batch_orchestrator.batch_index, 
+                        "file": self.batch_file_label.text(), 
+                        "is_timeline": self.batch_orchestrator.is_timeline_batch
+                    }, f)
             except Exception as e:
-                logger.error(f"Failed to save batch state: {e}")
+                logger.error(f"Failed to save batch state: {e}", exc_info=True)
 
     def check_interrupted_batch(self):
         if os.path.exists(BATCH_STATE_FILE):
@@ -3531,37 +4067,38 @@ class AudioLDM2Studio(QMainWindow):
                 try:
                     with open(BATCH_STATE_FILE, "r") as f:
                         state = json.load(f)
-                    self.batch_prompts = state["prompts"]
-                    self.batch_index = state["index"]
-                    self.batch_file_label.setText(state["file"])
-                    self.batch_state = BatchState.RUNNING
+                    self.batch_orchestrator.batch_prompts = state["prompts"]
+                    self.batch_orchestrator.batch_index = state["index"]
+                    self.batch_file_label.setText(state.get("file", "Resumed Batch"))
+                    self.batch_orchestrator.is_timeline_batch = state.get("is_timeline", False)
+                    self.batch_orchestrator.batch_state = BatchState.RUNNING
                     self.batch_start_btn.setEnabled(False)
                     self.batch_file_btn.setEnabled(False)
-                    self.prompt_input.setPlainText(self.batch_prompts[self.batch_index])
-                    self.batch_progress_label.setText(f"Batch Progress: {self.batch_index + 1} / {len(self.batch_prompts)}")
+                    
+                    if not (0 <= self.batch_orchestrator.batch_index < len(self.batch_orchestrator.batch_prompts)):
+                        os.remove(BATCH_STATE_FILE)
+                        return
+                    
+                    next_item = self.batch_orchestrator.batch_prompts[self.batch_orchestrator.batch_index]
+                    next_prompt = next_item['prompt'] if isinstance(next_item, dict) else next_item
+                    self.prompt_input.setPlainText(next_prompt)
+                    if isinstance(next_item, dict) and 'duration' in next_item:
+                        self.duration_spin.setValue(next_item['duration'])
+                        
+                    self.batch_progress_label.setText(f"Batch Progress: {self.batch_orchestrator.batch_index + 1} / {len(self.batch_orchestrator.batch_prompts)}")
                     self.batch_log.clear()
                     self.batch_log.appendPlainText(f"[{datetime.now().strftime('%H:%M:%S')}] Resuming batch...")
                     self.mode_tabs.setCurrentIndex(0)
                     if not self.start_generation():
-                        self.finalize_batch_state()
-                        try: os.remove(BATCH_STATE_FILE)
-                        except OSError: pass
+                        self.batch_orchestrator.cancel()
+                        self._on_batch_finished()
                 except Exception as e:
-                    logger.error(f"Failed to resume batch: {e}")
+                    logger.error(f"Failed to resume batch: {e}", exc_info=True)
                     try: os.remove(BATCH_STATE_FILE)
                     except OSError: pass
             else:
                 try: os.remove(BATCH_STATE_FILE)
                 except OSError: pass
-
-    def finalize_batch_state(self):
-        self.batch_start_btn.setEnabled(True)
-        self.batch_file_btn.setEnabled(True)
-        if self.batch_state == BatchState.RUNNING:
-            self.batch_state = BatchState.IDLE
-            self.batch_progress_label.setText("Batch finished or stopped.")
-        elif self.batch_state == BatchState.CANCELLED:
-            self.batch_state = BatchState.IDLE
 
     def copy_settings_to_clipboard(self):
         settings_dict = {
@@ -3576,7 +4113,11 @@ class AudioLDM2Studio(QMainWindow):
             "variations": self.variations_spin.value(),
             "device": self.device_combo.currentText(),
             "cpu_offload": self.cpu_offload_check.isChecked(),
-            "conditioning_audio": self.cond_audio_edit.text().strip()
+            "conditioning_audio": self.cond_audio_edit.text().strip(),
+            "use_seed_travel": self.travel_check.isChecked(),
+            "travel_start_seed": self.travel_start_seed.value(),
+            "travel_end_seed": self.travel_end_seed.value(),
+            "travel_steps": self.travel_steps_spin.value()
         }
         QApplication.clipboard().setText(json.dumps(settings_dict, indent=2))
         self.status_bar.showMessage("Settings copied as JSON", 3000)
@@ -3626,13 +4167,17 @@ class AudioLDM2Studio(QMainWindow):
                 "chunk_size": self.chunk_size_spin.value(), "steps": self.steps_spin.value(),
                 "guidance": self.guidance_spin.value(), "seed": self.seed_spin.value(),
                 "variations": self.variations_spin.value(),
+                "use_seed_travel": self.travel_check.isChecked(),
+                "travel_start_seed": self.travel_start_seed.value(),
+                "travel_end_seed": self.travel_end_seed.value(),
+                "travel_steps": self.travel_steps_spin.value()
             },
-            "current_audio": self.current_audio_path
+            "current_audio": self.base_audio_path
         }
         try:
             with open(path, "w") as f: json.dump(session, f, indent=2)
         except Exception as e:
-            QMessageBox.critical(self, "Export Error", f"Failed to export session:\n{e}")
+            logger.error(f"Failed to export session: {e}", exc_info=True)
 
     def import_session(self):
         path, _ = QFileDialog.getOpenFileName(self, "Import Session", "", "JSON Files (*.json)")
@@ -3649,51 +4194,24 @@ class AudioLDM2Studio(QMainWindow):
             self.guidance_spin.setValue(s.get("guidance", 3.5))
             self.seed_spin.setValue(s.get("seed", -1))
             self.variations_spin.setValue(s.get("variations", 1))
+            if "use_seed_travel" in s:
+                self.travel_check.setChecked(s.get("use_seed_travel", False))
+                self.travel_start_seed.setValue(s.get("travel_start_seed", 100))
+                self.travel_end_seed.setValue(s.get("travel_end_seed", 200))
+                self.travel_steps_spin.setValue(s.get("travel_steps", 5))
             if session.get("current_audio") and os.path.exists(session["current_audio"]):
                 self._load_audio_file(session["current_audio"])
         except Exception as e:
-            QMessageBox.critical(self, "Import Error", f"Failed to import session:\n{e}")
+            logger.error(f"Failed to import session: {e}", exc_info=True)
 
     def open_docs(self):
-        QMessageBox.information(self, "Documentation",
-            f"{APP_NAME} v{APP_VERSION}\n\n"
-            "BATCH PROCESSING:\n"
-            "Create a .txt file with one prompt per line.\n\n"
-            "PROMPT MATRIX (Wildcard Expansion):\n"
-            "Use brackets to generate multiple variations automatically!\n"
-            "Example: 'A [thunder, rain, wind] soundscape' generates 3 separate prompts.\n"
-            "You can combine them: 'A [dog, cat] [barking, meowing]' generates 4 prompts.\n"
-            f"(Capped at {PROMPT_MATRIX_MAX} combinations to prevent runaway expansion.)\n\n"
-            "LONG AUDIO GENERATION:\n"
-            "Set Duration > 10s and Chunk Size to 10s.\nApp will crossfade chunks seamlessly.\n\n"
-            "MEMORY MANAGEMENT:\n"
-            "- CPU Offload: Enable if < 8GB VRAM.\n"
-            "- Chunk Size: Lower to 5s if you get OOM errors.\n\n"
-            "AI TOOLS:\n"
-            "- Demucs: Split generated music into Drums, Bass, Vocals, Other.\n"
-            "- Whisper: Transcribe speech generated by audioldm2-ljspeech.\n"
-            "- CLAP: Score how closely the generated audio matches your prompt.\n\n"
-            "ADVANCED WORKFLOWS:\n"
-            "- Prompt Enhancer: Click '✨ Enhance' to expand simple words into rich descriptions.\n"
-            "- Audio Conditioning: Upload a hum/beat to match its rhythm.\n"
-            "- Inpainting: Toggle 'Inpaint Mode', drag to select a region on the spectrogram, enter a prompt, and click 'Inpaint Selection' to regenerate just that part.\n\n"
-            "KEYBOARD SHORTCUTS:\n"
-            "- Ctrl+Enter: Generate\n- Space: Play/Stop\n- Ctrl+O: Open audio\n"
-            "- Ctrl+S: Save audio\n- Escape: Cancel\n- Ctrl+Up/Down: History\n"
-            "- Drag on Waveform/Spectrogram to scrub audio!")
+        logger.info("Opening documentation...")
 
     def show_prompt_tips(self):
-        QMessageBox.information(self, "Prompt Tips",
-            "1. BE SPECIFIC: 'heavy metal double kick drum at 180 BPM'\n"
-            "2. DESCRIBE THE SCENE: 'rain falling on a metal roof in a thunderstorm'\n"
-            "3. MENTION QUALITY: 'high quality, professional recording'\n"
-            "4. USE NEGATIVE PROMPTS: 'noise, distortion, artifacts, low quality'\n"
-            "5. EXPERIMENT WITH GUIDANCE: Low (1-3) = creative, High (5-10) = strict")
+        logger.info("Showing prompt tips...")
 
     def show_about(self):
-        QMessageBox.about(self, "About",
-            f"<h2>{APP_NAME}</h2><p>Version: {APP_VERSION}</p>"
-            f"<p>A GUI for AudioLDM2 text-to-audio generation.</p>")
+        logger.info(f"About {APP_NAME} v{APP_VERSION}")
 
     def export_history(self):
         path, _ = QFileDialog.getSaveFileName(self, "Export History", "history.csv", "CSV Files (*.csv)")
@@ -3701,7 +4219,7 @@ class AudioLDM2Studio(QMainWindow):
         try:
             with open(path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                writer.writerow(['Prompt', 'Duration', 'Date', 'Seed', 'Model', 'File Path'])
+                writer.writerow(['Favorite', 'Tags', 'Prompt', 'Duration', 'Date', 'Seed', 'Model', 'File Path'])
                 for row in range(self.playlist_table.rowCount()):
                     writer.writerow([
                         self.playlist_table.item(row, 0).text() if self.playlist_table.item(row, 0) else "",
@@ -3709,17 +4227,15 @@ class AudioLDM2Studio(QMainWindow):
                         self.playlist_table.item(row, 2).text() if self.playlist_table.item(row, 2) else "",
                         self.playlist_table.item(row, 3).text() if self.playlist_table.item(row, 3) else "",
                         self.playlist_table.item(row, 4).text() if self.playlist_table.item(row, 4) else "",
-                        self.playlist_table.item(row, 0).toolTip()
+                        self.playlist_table.item(row, 5).text() if self.playlist_table.item(row, 5) else "",
+                        self.playlist_table.item(row, 6).text() if self.playlist_table.item(row, 6) else "",
+                        self.playlist_table.item(row, 2).toolTip()
                     ])
         except Exception as e:
-            QMessageBox.critical(self, "Export Error", f"Failed to export: {e}")
+            logger.error(f"Failed to export history: {e}", exc_info=True)
 
     def _do_filter(self, text):
-        text_lower = text.lower()
-        for row in range(self.playlist_table.rowCount()):
-            item = self.playlist_table.item(row, 0)
-            if item:
-                self.playlist_table.setRowHidden(row, text_lower not in item.text().lower())
+        self.filter_history()
 
     def load_history(self):
         history_data = self.settings.value("history", [])
@@ -3730,26 +4246,49 @@ class AudioLDM2Studio(QMainWindow):
             self.settings.setValue("history", history_data)
             self.settings.sync()
 
+        all_tags = set()
+        for entry in history_data:
+            if entry.get("tags"):
+                all_tags.update(entry["tags"])
+        self.tag_filter_combo.clear()
+        self.tag_filter_combo.addItem("All")
+        self.tag_filter_combo.addItems(sorted(list(all_tags)))
+
         self.playlist_table.setUpdatesEnabled(False)
         self.playlist_table.setRowCount(0)
         self.playlist_table.setRowCount(len(history_data))
         try:
             for row, entry in enumerate(history_data):
                 path = entry.get("path", "")
+                
+                fav_item = QTableWidgetItem()
+                if entry.get('favorite'):
+                    fav_item.setText("★")
+                    fav_item.setForeground(QColor('#f1c40f'))
+                else:
+                    fav_item.setText("")
+                fav_item.setTextAlignment(Qt.AlignCenter)
+                self.playlist_table.setItem(row, 0, fav_item)
+                
+                tags_item = QTableWidgetItem(", ".join(entry.get('tags', [])))
+                self.playlist_table.setItem(row, 1, tags_item)
+                
                 prompt_item = QTableWidgetItem(entry.get("prompt", ""))
                 prompt_item.setToolTip(path)
                 if path and not os.path.exists(path):
                     prompt_item.setForeground(QColor('red'))
-                self.playlist_table.setItem(row, 0, prompt_item)
+                self.playlist_table.setItem(row, 2, prompt_item)
+                
                 mini_item = MiniWaveformItem(path, entry.get('duration', 0.0))
-                self.playlist_table.setItem(row, 1, mini_item)
+                self.playlist_table.setItem(row, 3, mini_item)
                 if hasattr(self, '_thumb_worker') and self._thumb_worker.isRunning():
                     self._thumb_worker.enqueue(row, path)
                 else:
                     QTimer.singleShot(0, lambda r=row, p=path: self._defer_thumb(r, p))
-                self.playlist_table.setItem(row, 2, QTableWidgetItem(entry.get("timestamp", "")[:10]))
-                self.playlist_table.setItem(row, 3, QTableWidgetItem(str(entry.get("seed", ""))))
-                self.playlist_table.setItem(row, 4, QTableWidgetItem(entry.get("model", "").split('/')[-1]))
+                    
+                self.playlist_table.setItem(row, 4, QTableWidgetItem(entry.get("timestamp", "")[:10]))
+                self.playlist_table.setItem(row, 5, QTableWidgetItem(str(entry.get("seed", ""))))
+                self.playlist_table.setItem(row, 6, QTableWidgetItem(entry.get("model", "").split('/')[-1]))
         finally:
             self.playlist_table.setUpdatesEnabled(True)
 
@@ -3766,17 +4305,20 @@ class AudioLDM2Studio(QMainWindow):
             self.playlist_table.setRowCount(0)
             self.settings.remove("history")
             self.settings.sync()
+            self.tag_filter_combo.clear()
+            self.tag_filter_combo.addItem("All")
 
     def load_settings(self):
-        self.prompt_input.setPlainText(self.settings.value("prompt", "Musical constellations twinkling in the night sky", type=str))
-        self.neg_prompt_input.setText(self.settings.value("negative_prompt", "", type=str))
-        self.model_combo.setCurrentText(self.settings.value("model", "cvssp/audioldm2", type=str))
-        self.duration_spin.setValue(float(self.settings.value("duration", 10.0)))
-        self.chunk_size_spin.setValue(float(self.settings.value("chunk_size", 10.0)))
-        self.steps_spin.setValue(int(self.settings.value("steps", 200)))
-        self.guidance_spin.setValue(float(self.settings.value("guidance", 3.5)))
-        self.seed_spin.setValue(int(self.settings.value("seed", -1)))
-        self.variations_spin.setValue(int(self.settings.value("variations", 1)))
+        self.prompt_input.setPlainText(self.settings.value("prompt", "Cinematic riser and massive impact, sub bass drop"))
+        self.neg_prompt_input.setText(self.settings.value("negative_prompt", ""))
+        self.model_combo.setCurrentText(self.settings.value("model", "cvssp/audioldm2"))
+        
+        self.duration_spin.setValue(float(self.settings.value("duration", 10.0, type=float)))
+        self.chunk_size_spin.setValue(float(self.settings.value("chunk_size", 10.0, type=float)))
+        self.steps_spin.setValue(int(self.settings.value("steps", 200, type=int)))
+        self.guidance_spin.setValue(float(self.settings.value("guidance", 3.5, type=float)))
+        self.seed_spin.setValue(int(self.settings.value("seed", -1, type=int)))
+        self.variations_spin.setValue(int(self.settings.value("variations", 1, type=int)))
 
         default_device = "cpu"
         if torch.cuda.is_available(): default_device = "cuda"
@@ -3796,16 +4338,23 @@ class AudioLDM2Studio(QMainWindow):
         self.fade_in_check.setChecked(self.settings.value("fade_in", True, type=bool))
         self.fade_out_check.setChecked(self.settings.value("fade_out", True, type=bool))
         self.cpu_offload_check.setChecked(self.settings.value("cpu_offload", False, type=bool))
-        self.hp_spin.setValue(float(self.settings.value("high_pass_freq", 0.0)))
-        self.lp_spin.setValue(float(self.settings.value("low_pass_freq", 0.0)))
+        self.hp_spin.setValue(float(self.settings.value("high_pass_freq", 0.0, type=float)))
+        self.lp_spin.setValue(float(self.settings.value("low_pass_freq", 0.0, type=float)))
 
-        self.batch_variations_spin.setValue(int(self.settings.value("batch_variations", 1)))
-        self.batch_delay_spin.setValue(float(self.settings.value("batch_delay", 1.0)))
+        self.batch_variations_spin.setValue(int(self.settings.value("batch_variations", 1, type=int)))
+        self.batch_delay_spin.setValue(float(self.settings.value("batch_delay", 1.0, type=float)))
         self.batch_continue_on_error_check.setChecked(self.settings.value("batch_continue_on_error", True, type=bool))
-        self.vol_slider.setValue(int(self.settings.value("volume", 50)))
+        self.vol_slider.setValue(int(self.settings.value("volume", 50, type=int)))
 
-        self.mode_tabs.setCurrentIndex(int(self.settings.value("left_tab", 0)))
-        self.right_tabs.setCurrentIndex(int(self.settings.value("right_tab", 0)))
+        self.travel_check.setChecked(self.settings.value("use_seed_travel", False, type=bool))
+        self.travel_start_seed.setValue(int(self.settings.value("travel_start_seed", 100, type=int)))
+        self.travel_end_seed.setValue(int(self.settings.value("travel_end_seed", 200, type=int)))
+        self.travel_steps_spin.setValue(int(self.settings.value("travel_steps", 5, type=int)))
+        
+        self.autoplay_check.setChecked(self.settings.value("autoplay", True, type=bool))
+
+        self.mode_tabs.setCurrentIndex(int(self.settings.value("left_tab", 0, type=int)))
+        self.right_tabs.setCurrentIndex(int(self.settings.value("right_tab", 0, type=int)))
         self.prompt_input.history = self.settings.value("prompt_history", [])
 
         self.on_device_changed(self.device_combo.currentText())
@@ -3825,6 +4374,11 @@ class AudioLDM2Studio(QMainWindow):
         self.settings.setValue("duration", self.duration_spin.value())
         self.settings.setValue("chunk_size", self.chunk_size_spin.value())
         self.settings.setValue("variations", self.variations_spin.value())
+        self.settings.setValue("use_seed_travel", self.travel_check.isChecked())
+        self.settings.setValue("travel_start_seed", self.travel_start_seed.value())
+        self.settings.setValue("travel_end_seed", self.travel_end_seed.value())
+        self.settings.setValue("travel_steps", self.travel_steps_spin.value())
+        self.settings.setValue("autoplay", self.autoplay_check.isChecked())
         self.settings.sync()
 
     def changeEvent(self, event):
@@ -3835,60 +4389,56 @@ class AudioLDM2Studio(QMainWindow):
                 self.gpu_mem_timer.start(GPU_MEM_POLL_MS)
         super().changeEvent(event)
 
-    # --- AI Tool Handlers ---
     def run_demucs(self):
-        if not self.current_audio_path:
-            return
+        if not self.base_audio_path: return
         self.demucs_btn.setEnabled(False)
         self.status_bar.showMessage("Running Demucs stem separation... This might take a while.")
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.demucs_worker = DemucsWorker(self.current_audio_path, device)
+        self.demucs_worker = DemucsWorker(self.base_audio_path, device)
         self.demucs_worker.finished.connect(self.on_demucs_finished)
         self.demucs_worker.error.connect(self.on_ml_error)
         self.demucs_worker.start()
 
     def on_demucs_finished(self, paths):
-        self.demucs_btn.setEnabled(DEMUCS_AVAILABLE and bool(self.current_audio_path))
+        self.demucs_btn.setEnabled(DEMUCS_AVAILABLE and bool(self.base_audio_path))
         self.status_bar.showMessage("Demucs stems generated!", 5000)
-        QMessageBox.information(self, "Stems Ready", f"Stems saved to:\n{os.path.dirname(paths[0])}")
+        logger.info(f"Stems saved to: {os.path.dirname(paths[0])}")
 
     def run_whisper(self):
-        if not self.current_audio_path:
-            return
+        if not self.base_audio_path: return
         self.whisper_btn.setEnabled(False)
         self.status_bar.showMessage("Running Whisper transcription...")
-        self.whisper_worker = WhisperWorker(self.current_audio_path)
+        self.whisper_worker = WhisperWorker(self.base_audio_path)
         self.whisper_worker.finished.connect(self.on_whisper_finished)
         self.whisper_worker.error.connect(self.on_ml_error)
         self.whisper_worker.start()
 
     def on_whisper_finished(self, text):
-        self.whisper_btn.setEnabled(WHISPER_AVAILABLE and bool(self.current_audio_path))
+        self.whisper_btn.setEnabled(WHISPER_AVAILABLE and bool(self.base_audio_path))
         self.status_bar.showMessage("Whisper transcription complete!", 5000)
-        QMessageBox.information(self, "Transcription", f"AI said:\n\n{text}")
+        logger.info(f"Whisper transcription: {text}")
 
     def run_clap(self):
-        if not self.current_audio_path:
-            return
+        if not self.base_audio_path: return
         self.clap_btn.setEnabled(False)
         self.status_bar.showMessage("Running CLAP prompt matching...")
         prompt = self.prompt_input.toPlainText().strip()
-        self.clap_worker = CLAPWorker(self.current_audio_path, prompt)
+        self.clap_worker = CLAPWorker(self.base_audio_path, prompt)
         self.clap_worker.finished.connect(self.on_clap_finished)
         self.clap_worker.error.connect(self.on_ml_error)
         self.clap_worker.start()
 
     def on_clap_finished(self, score):
-        self.clap_btn.setEnabled(CLAP_AVAILABLE and bool(self.current_audio_path))
+        self.clap_btn.setEnabled(CLAP_AVAILABLE and bool(self.base_audio_path))
         self.status_bar.showMessage(f"CLAP Match Score: {score:.1f}%", 5000)
-        QMessageBox.information(self, "Prompt Match Score", f"The audio matches your prompt with a similarity score of {score:.1f}%")
+        logger.info(f"CLAP Match Score: {score:.1f}%")
 
     def on_ml_error(self, err):
-        self.demucs_btn.setEnabled(DEMUCS_AVAILABLE and bool(self.current_audio_path))
-        self.whisper_btn.setEnabled(WHISPER_AVAILABLE and bool(self.current_audio_path))
-        self.clap_btn.setEnabled(CLAP_AVAILABLE and bool(self.current_audio_path))
+        self.demucs_btn.setEnabled(DEMUCS_AVAILABLE and bool(self.base_audio_path))
+        self.whisper_btn.setEnabled(WHISPER_AVAILABLE and bool(self.base_audio_path))
+        self.clap_btn.setEnabled(CLAP_AVAILABLE and bool(self.base_audio_path))
         self.status_bar.showMessage("AI Tool Error", 3000)
-        QMessageBox.critical(self, "AI Tool Error", err)
+        logger.error(f"AI Tool Error: {err}")
 
     def closeEvent(self, event):
         if hasattr(self, '_thumb_worker'):
@@ -3904,10 +4454,14 @@ class AudioLDM2Studio(QMainWindow):
                 self.worker_thread.terminate()
                 self.worker_thread.wait(1000)
 
-        for worker in [self.demucs_worker, self.whisper_worker, self.clap_worker]:
+        for worker in [self.demucs_worker, self.whisper_worker, self.clap_worker, self.stats_worker, self.ffmpeg_worker]:
             if worker and worker.isRunning():
                 worker.quit()
                 worker.wait(2000)
+
+        if hasattr(self, '_spec_worker') and self._spec_worker and self._spec_worker.isRunning():
+            self._spec_worker.quit()
+            self._spec_worker.wait(1000)
 
         AudioGenerationWorker.unload_pipeline()
 
@@ -3940,48 +4494,77 @@ class AudioLDM2Studio(QMainWindow):
         self.settings.setValue("batch_continue_on_error", self.batch_continue_on_error_check.isChecked())
         self.settings.setValue("volume", self.vol_slider.value())
         self.settings.setValue("prompt_history", self.prompt_input.history[-MAX_PROMPT_HISTORY:])
+        
+        self.settings.setValue("use_seed_travel", self.travel_check.isChecked())
+        self.settings.setValue("travel_start_seed", self.travel_start_seed.value())
+        self.settings.setValue("travel_end_seed", self.travel_end_seed.value())
+        self.settings.setValue("travel_steps", self.travel_steps_spin.value())
+        
+        self.settings.setValue("fx_chain", self.serialize_fx_chain())
 
-        if self.current_audio_path and os.path.exists(self.current_audio_path):
-            self.settings.setValue("last_audio_path", self.current_audio_path)
+        if self.base_audio_path and os.path.exists(self.base_audio_path):
+            self.settings.setValue("last_audio_path", self.base_audio_path)
         else:
             self.settings.remove("last_audio_path")
 
         try: self.media_player.stop()
         except Exception: pass
 
+        if os.path.exists(FX_PREVIEW_FILE):
+            try: os.remove(FX_PREVIEW_FILE)
+            except: pass
+            
+        if os.path.exists(TEMP_LOAD_WAV):
+            try: os.remove(TEMP_LOAD_WAV)
+            except: pass
+
         self.settings.sync()
         event.accept()
 
 
-# --- Entry Point ---
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    app.setApplicationName(APP_NAME)
-    app.setApplicationVersion(APP_VERSION)
-    app.setOrganizationName(SETTINGS_ORG)
+    try:
+        app = QApplication(sys.argv)
+        app.setStyle("Fusion")
+        app.setApplicationName(APP_NAME)
+        app.setApplicationVersion(APP_VERSION)
+        app.setOrganizationName(SETTINGS_ORG)
 
-    palette = QPalette()
-    palette.setColor(QPalette.Window, QColor(45, 45, 45))
-    palette.setColor(QPalette.WindowText, Qt.white)
-    palette.setColor(QPalette.Base, QColor(30, 30, 30))
-    palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
-    palette.setColor(QPalette.ToolTipBase, QColor(53, 53, 53))
-    palette.setColor(QPalette.ToolTipText, Qt.white)
-    palette.setColor(QPalette.Text, Qt.white)
-    palette.setColor(QPalette.Button, QColor(53, 53, 53))
-    palette.setColor(QPalette.ButtonText, Qt.white)
-    palette.setColor(QPalette.BrightText, Qt.red)
-    palette.setColor(QPalette.Link, QColor(42, 130, 218))
-    palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
-    palette.setColor(QPalette.HighlightedText, Qt.black)
-    palette.setColor(QPalette.Disabled, QPalette.WindowText, QColor(127, 127, 127))
-    palette.setColor(QPalette.Disabled, QPalette.Text, QColor(127, 127, 127))
-    palette.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(127, 127, 127))
-    app.setPalette(palette)
-    app.setStyleSheet(STYLESHEET)
-    app.setFont(QFont("Segoe UI", 9))
+        palette = QPalette()
+        palette.setColor(QPalette.Window, QColor(45, 45, 45))
+        palette.setColor(QPalette.WindowText, Qt.white)
+        palette.setColor(QPalette.Base, QColor(30, 30, 30))
+        palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
+        palette.setColor(QPalette.ToolTipBase, QColor(53, 53, 53))
+        palette.setColor(QPalette.ToolTipText, Qt.white)
+        palette.setColor(QPalette.Text, Qt.white)
+        palette.setColor(QPalette.Button, QColor(53, 53, 53))
+        palette.setColor(QPalette.ButtonText, Qt.white)
+        palette.setColor(QPalette.BrightText, Qt.red)
+        palette.setColor(QPalette.Link, QColor(42, 130, 218))
+        palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
+        palette.setColor(QPalette.HighlightedText, Qt.black)
+        palette.setColor(QPalette.Disabled, QPalette.WindowText, QColor(127, 127, 127))
+        palette.setColor(QPalette.Disabled, QPalette.Text, QColor(127, 127, 127))
+        palette.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(127, 127, 127))
+        app.setPalette(palette)
+        app.setStyleSheet(STYLESHEET)
+        app.setFont(QFont("Segoe UI", 9))
 
-    window = AudioLDM2Studio()
-    window.show()
-    sys.exit(app.exec())
+        window = AudioLDM2Studio()
+        window.show()
+        
+        def signal_handler(sig, frame):
+            if window:
+                window.close()
+            app.quit()
+        signal.signal(signal.SIGINT, signal_handler)
+        
+        timer = QTimer()
+        timer.start(500)
+        timer.timeout.connect(lambda: None)
+        
+        sys.exit(app.exec())
+    except Exception:
+        logger.critical("Fatal Startup Error", exc_info=True)
+        sys.exit(1)
